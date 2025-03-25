@@ -620,6 +620,8 @@ class LLMEngine:
             prompt_adapter_request))
 
         # Create a SequenceGroup based on SamplingParams or PoolingParams
+        print(type(params))
+        print(SamplingParams)
         if isinstance(params, SamplingParams):
             seq_group = self._create_sequence_group_with_sampling(
                 request_id,

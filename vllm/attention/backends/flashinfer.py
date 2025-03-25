@@ -9,10 +9,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Type
 from vllm.multimodal import MultiModalPlaceholderMap
 
 try:
+    print("importing backend here",flush=True)
     from flashinfer import BatchDecodeWithPagedKVCacheWrapper
     from flashinfer.decode import CUDAGraphBatchDecodeWithPagedKVCacheWrapper
     from flashinfer.prefill import BatchPrefillWithPagedKVCacheWrapper
-
+    print("importing backend here 2",flush=True)
     from vllm.vllm_flash_attn import flash_attn_varlen_func
     FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 except ImportError:
