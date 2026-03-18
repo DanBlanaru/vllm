@@ -2,7 +2,10 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from collections import defaultdict
+
 import torch
+import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
@@ -19,6 +22,8 @@ from vllm.platforms import current_platform
 from .base_device_communicator import DeviceCommunicatorBase
 
 logger = init_logger(__name__)
+
+MB = 1024 * 1024
 
 
 class CudaCommunicator(DeviceCommunicatorBase):
@@ -127,6 +132,43 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 scope="global",
             )
 
+        self._ar_histogram: dict[str, dict[int, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+        self._ar_call_count = 0
+        self._ar_histogram_dump_interval = 1000
+
+    def _track_allreduce(self, input_: torch.Tensor, backend: str):
+        size_bytes = input_.numel() * input_.element_size()
+        self._ar_histogram[backend][size_bytes] += 1
+        self._ar_call_count += 1
+        if self._ar_call_count % self._ar_histogram_dump_interval == 0:
+            self._dump_ar_histogram()
+
+    def _dump_ar_histogram(self):
+        if dist.get_rank() != 0:
+            return
+        logger.warning(
+            "AllReduce Dispatch Histogram (total_calls=%d):",
+            self._ar_call_count,
+        )
+        all_sizes: set[int] = set()
+        for sizes in self._ar_histogram.values():
+            all_sizes.update(sizes.keys())
+        for size_bytes in sorted(all_sizes):
+            if size_bytes >= MB:
+                size_str = f"{size_bytes / MB:.2f} MB"
+            elif size_bytes >= 1024:
+                size_str = f"{size_bytes / 1024:.2f} KB"
+            else:
+                size_str = f"{size_bytes} B"
+            parts = []
+            for backend in sorted(self._ar_histogram.keys()):
+                count = self._ar_histogram[backend].get(size_bytes, 0)
+                if count > 0:
+                    parts.append(f"{backend}={count}")
+            logger.warning("  %s: %s", size_str, ", ".join(parts))
+
     def all_reduce(self, input_):
         # since currently we perform copy input -> symm_input -> out-of-place AR
         # return symm_output, we don't need to check if input is symmetric
@@ -135,6 +177,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = torch.ops.vllm.all_reduce_symmetric_with_copy(input_)
             if out is not None:
+                self._track_allreduce(input_, "nccl_symm")
                 return out
         # always try quick reduce first, then custom allreduce,
         # and then pynccl. (quick reduce just for ROCM MI3*)
@@ -146,6 +189,7 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = qr_comm.quick_all_reduce(input_)
             assert out is not None
+            self._track_allreduce(input_, "quick_reduce")
             return out
         ca_comm = self.ca_comm
         if (
@@ -155,26 +199,28 @@ class CudaCommunicator(DeviceCommunicatorBase):
         ):
             out = ca_comm.custom_all_reduce(input_)
             assert out is not None
+            self._track_allreduce(input_, "custom_ar")
             return out
         symm_mem_comm = self.symm_mem_comm
         if symm_mem_comm is not None and symm_mem_comm.should_use_symm_mem(input_):
             out = symm_mem_comm.all_reduce(input_)
             assert out is not None
+            self._track_allreduce(input_, "symm_mem")
             return out
         pynccl_comm = self.pynccl_comm
         if pynccl_comm is None or pynccl_comm.disabled:
+            self._track_allreduce(input_, "torch_dist")
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
             return out
         assert pynccl_comm is not None
         out = pynccl_comm.all_reduce(input_)
         if out is None:
-            # fall back to the default all-reduce using PyTorch.
-            # this usually happens during testing.
-            # when we run the model, allreduce only happens for the TP
-            # group, where we always have either custom allreduce or pynccl.
+            self._track_allreduce(input_, "torch_dist")
             out = input_.clone()
             torch.distributed.all_reduce(out, group=self.device_group)
+        else:
+            self._track_allreduce(input_, "pynccl")
         return out
 
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
