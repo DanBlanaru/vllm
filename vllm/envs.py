@@ -1389,6 +1389,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_MOE_ROUTING_SIMULATION_STRATEGY": lambda: os.environ.get(
         "VLLM_MOE_ROUTING_SIMULATION_STRATEGY", ""
     ).lower(),
+    # Path to a JSONL file for detailed per-step expert load logging.
+    # When set, each EPLB step writes per-layer, per-rank load distributions
+    # and imbalance metrics (max/mean, CoV, Gini) to this file.
+    "VLLM_EP_LOAD_LOG_FILE": lambda: os.environ.get(
+        "VLLM_EP_LOAD_LOG_FILE", ""
+    ),
     # Regex timeout for use by the vLLM tool parsing plugins.
     "VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS": lambda: int(
         os.getenv("VLLM_TOOL_PARSE_REGEX_TIMEOUT_SECONDS", "1")

@@ -56,6 +56,7 @@ class ClientArgs(NamedTuple):
     conversation_sampling: ConversationSampling
     request_rate: float
     max_retries: int
+    replay_mode: bool = False
 
 
 class RequestArgs(NamedTuple):
@@ -365,17 +366,20 @@ async def send_turn(
     req_args: RequestArgs,
     verbose: bool,
     verify_output: bool,
+    replay_mode: bool = False,
 ) -> RequestStats | None:
     assert messages_to_use > 0
     assert messages_to_use <= len(conversation_messages)
 
-    messages = conversation_messages[:messages_to_use]
+    # Only send role + content to the API (extra metadata keys are stripped)
+    messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in conversation_messages[:messages_to_use]
+    ]
 
     # Index of the next message (the role should be "user")
     index = messages_to_use - 1
 
-    # Verify that the message has only two keys, "role" and "content"
-    assert len(messages[index].keys()) == 2
     assert "role" in messages[index] and "content" in messages[index]
     assert messages[index]["role"] == "user", (
         f"Failed on conversation ID {conv_id}, message role should be user"
@@ -508,8 +512,11 @@ async def send_turn(
             if orig_content != output_content:
                 raise ValueError(debug_info)
 
-        # Update the answer
-        conversation_messages[answer_index]["content"] = output_content
+        if not replay_mode:
+            # Update the answer
+            conversation_messages[answer_index]["content"] = output_content
+        # In replay_mode, keep the recorded response so subsequent turns
+        # always see the original trace context.
     else:
         # A user prompt that has no answer, add the answer as a new message
         new_answer = {"role": "assistant", "content": output_content}
@@ -692,6 +699,7 @@ async def client_main(
                         req_args,
                         args.print_content,
                         args.verify_output,
+                        replay_mode=args.replay_mode,
                     )
                     if result is not None:
                         result_queue.put(result)
@@ -849,6 +857,7 @@ def get_client_config(
         conversation_sampling=args.conversation_sampling,
         request_rate=args.request_rate,
         max_retries=args.max_retries,
+        replay_mode=getattr(args, "replay_mode", False),
     )
 
     if args.limit_min_tokens > 0 or args.limit_max_tokens > 0:
@@ -1468,6 +1477,23 @@ async def main() -> None:
         "(for example: --warmup-percentages=0%%,50%%)",
     )
 
+    parser.add_argument(
+        "--replay-mode",
+        default=False,
+        action="store_true",
+        help="Replay mode: keep recorded assistant responses in context "
+        "instead of overwriting with model output. Ensures identical "
+        "prefill content across turns regardless of model.",
+    )
+    parser.add_argument(
+        "--per-turn-output",
+        type=str,
+        default=None,
+        help="Path to write per-turn CSV with columns: "
+        "interaction_id, turn_idx, ttft_ms, tpot_ms, latency_ms, "
+        "input_tokens, output_tokens, approx_cached_pct, timestamp_ms",
+    )
+
     args = parser.parse_args()
 
     logger.info(args)
@@ -1669,6 +1695,38 @@ async def main() -> None:
         )
         with open(args.stats_json_output, "w") as f:
             json.dump(stats_data, f, indent=2)
+
+    if args.per_turn_output is not None:
+        import csv
+
+        with open(args.per_turn_output, "w", newline="") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow([
+                "interaction_id",
+                "turn_idx",
+                "ttft_ms",
+                "tpot_ms",
+                "latency_ms",
+                "input_tokens",
+                "output_tokens",
+                "approx_cached_pct",
+                "timestamp_ms",
+            ])
+            for rs in client_metrics:
+                writer.writerow([
+                    rs.conversation_id,
+                    rs.input_num_turns,
+                    f"{rs.ttft_ms:.2f}",
+                    f"{rs.tpot_ms:.2f}",
+                    f"{rs.latency_ms:.2f}",
+                    rs.input_num_tokens,
+                    rs.output_num_tokens,
+                    f"{rs.approx_cached_percent:.2f}",
+                    f"{rs.start_time_ms:.2f}",
+                ])
+        logger.info(
+            f"{Color.GREEN}Per-turn CSV: {args.per_turn_output}{Color.RESET}"
+        )
 
     if args.output_file is not None:
         # Write a JSON file with the updated conversations

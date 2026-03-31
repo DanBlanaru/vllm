@@ -26,7 +26,9 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import json as _json
 import threading
+import time as _time
 from collections.abc import Sequence
 from dataclasses import dataclass
 
@@ -56,6 +58,73 @@ from .rebalance_execute import (
 )
 
 logger = init_logger(__name__)
+
+
+def _gini_coefficient(values: np.ndarray) -> float:
+    """Compute Gini coefficient of a 1-D array (0 = perfect equality)."""
+    if values.sum() == 0:
+        return 0.0
+    sorted_vals = np.sort(values)
+    n = len(sorted_vals)
+    index = np.arange(1, n + 1)
+    return float(
+        (2.0 * (index * sorted_vals).sum()) / (n * sorted_vals.sum()) - (n + 1) / n
+    )
+
+
+def _log_ep_load_detail(
+    log_file: str,
+    step_idx: int,
+    model_name: str,
+    expert_load_pass: torch.Tensor,
+    ep_size: int,
+) -> None:
+    """Write detailed per-layer expert load metrics to a JSONL file.
+
+    Args:
+        log_file: Path to the output JSONL file.
+        step_idx: Current EPLB step index.
+        model_name: Name of the model being served.
+        expert_load_pass: Tensor of shape (num_moe_layers, num_physical_experts)
+            containing global (all-reduced) token counts.
+        ep_size: Number of EP ranks.
+    """
+    load_np = expert_load_pass.cpu().numpy()
+    num_layers, num_experts = load_np.shape
+    experts_per_rank = num_experts // ep_size
+
+    per_layer_records = []
+    for layer_idx in range(num_layers):
+        layer_load = load_np[layer_idx]
+        tokens_per_rank = layer_load.reshape(ep_size, experts_per_rank).sum(axis=1)
+
+        mean_load = float(tokens_per_rank.mean())
+        max_load = float(tokens_per_rank.max())
+        max_mean_ratio = max_load / mean_load if mean_load > 0 else 0.0
+        std_load = float(tokens_per_rank.std())
+        cov = std_load / mean_load if mean_load > 0 else 0.0
+        gini = _gini_coefficient(tokens_per_rank.astype(np.float64))
+
+        per_layer_records.append({
+            "layer": layer_idx,
+            "tokens_per_rank": tokens_per_rank.tolist(),
+            "total_tokens": int(layer_load.sum()),
+            "max_mean_ratio": round(max_mean_ratio, 4),
+            "cov": round(cov, 4),
+            "gini": round(gini, 4),
+        })
+
+    record = {
+        "timestamp": _time.time(),
+        "step": step_idx,
+        "model": model_name,
+        "ep_size": ep_size,
+        "num_layers": num_layers,
+        "layers": per_layer_records,
+    }
+
+    with open(log_file, "a") as f:
+        f.write(_json.dumps(record) + "\n")
 
 
 @dataclass
@@ -599,6 +668,17 @@ class EplbState:
                         self.expert_rearrangement_step_interval
                         - self.expert_rearrangement_step,
                     )
+
+                    from vllm import envs
+                    ep_load_log = envs.VLLM_EP_LOAD_LOG_FILE
+                    if ep_load_log:
+                        _log_ep_load_detail(
+                            ep_load_log,
+                            self.expert_rearrangement_step,
+                            eplb_model_state.model_name,
+                            expert_load_pass,
+                            ep_group.size(),
+                        )
 
         # Update the expert load sliding window
         if not is_dummy:

@@ -3101,6 +3101,28 @@ class GPUModelRunner(
             log_stats=self.parallel_config.eplb_config.log_balancedness,
         )
 
+    def _log_step_metadata(self, scheduler_output: "SchedulerOutput") -> None:
+        """Log per-step scheduling metadata alongside EP load metrics."""
+        from vllm import envs
+        ep_load_log = envs.VLLM_EP_LOAD_LOG_FILE
+        if not ep_load_log:
+            return
+
+        import json as _json
+        import time as _time
+
+        record = {
+            "type": "step_metadata",
+            "timestamp": _time.time(),
+            "total_num_scheduled_tokens": (
+                scheduler_output.total_num_scheduled_tokens
+            ),
+            "num_new_requests": len(scheduler_output.scheduled_new_reqs),
+            "num_requests": len(scheduler_output.num_scheduled_tokens),
+        }
+        with open(ep_load_log, "a") as f:
+            f.write(_json.dumps(record) + "\n")
+
     def setup_eplb_from_mapping(
         self,
         expanded_physical_to_logical: torch.Tensor,
@@ -4310,6 +4332,8 @@ class GPUModelRunner(
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
+
+        self._log_step_metadata(scheduler_output)
 
         # self.kv_connector_output may be modified during drafting
         kv_connector_output = self.kv_connector_output
