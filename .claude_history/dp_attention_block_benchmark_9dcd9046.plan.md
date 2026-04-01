@@ -137,6 +137,26 @@ Projections and allreduce are flat (~12 + 10 + 18 = 40 us fixed floor).
 **Attention depends only on total KV, not distribution across requests.**
 5 reqs x 120k/req vs 20 reqs x 30k/req: identical ~87-88 us.
 
+### Grid: Skewed vs uniform per-request KV (same total)
+
+RL workloads have a few long-context requests (60k) mixed with many short ones.
+Does the distribution matter? Tested at 800k and 1.2M total with 20 reqs:
+
+```
+  800k total, 20 reqs:
+    uniform (40k/req)           attn = 111.6 us    total = 149.0 us
+    3x60k + 17x36k             attn = 110.9 us    total = 148.3 us
+    10x60k + 10x20k            attn = 111.7 us    total = 149.0 us
+
+  1.2M total, 20 reqs:
+    uniform (60k/req)           attn = 158.9 us    total = 196.4 us
+    3x60k + 17x60k             attn = 159.0 us    total = 196.4 us
+    10x60k + 10x60k            attn = 158.8 us    total = 196.2 us
+```
+
+**Identical within noise.** The attention kernel depends only on total KV tokens,
+not how they are distributed across requests.
+
 ### RL imbalance estimate
 
 From reference points:
@@ -174,19 +194,89 @@ To be explored as a separate step:
 - Transfer cost vs imbalance waste analysis
 - Threshold-based vs periodic triggering
 
-## Usage
+## Reproducing Results
 
+All results were collected on 8x H200 (DGX/HGX, NVSwitch).
+Container: vllm-openai with FLASH_ATTN backend, bf16 KV cache.
+
+**Files:**
+- `vllm/benchmarks/dp_imbalance/benchmark_dp_attn.py` -- single-pair benchmark (torchrun)
+- `vllm/benchmarks/dp_imbalance/run_grid.py` -- grid runner (spawns torchrun per config)
+
+**Environment variables** (required for configs with per-request KV > 8192):
 ```bash
-# Single pair (inside vllm container)
-torchrun --nproc_per_node=8 benchmarks/dp_imbalance/benchmark_dp_attn.py \
-    --distribution uniform --trials 100 --cuda-graphs
-
-torchrun --nproc_per_node=8 benchmarks/dp_imbalance/benchmark_dp_attn.py \
-    --distribution custom --dp0-reqs 20 --dp0-total-kv 1200000 \
-    --dp1-reqs 15 --dp1-total-kv 200000 --trials 50 --cuda-graphs
-
-# Grid sweep (each config in a fresh process)
-python benchmarks/dp_imbalance/run_grid.py --trials 50 --cuda-graphs
+export ENVS="-e HF_HOME=/scratch/bench_serving/hf_cache -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1"
+export CONTAINER=epic_sanderson  # adjust to your container name
+export BENCH=/scratch/bench_serving/vllm/benchmarks/dp_imbalance
 ```
 
-Requires `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` for configs with per-request KV > 8192.
+### Single pair run
+
+```bash
+# Uniform (original scenario)
+docker exec $ENVS $CONTAINER torchrun --nproc_per_node=8 \
+    $BENCH/benchmark_dp_attn.py \
+    --distribution uniform --trials 100 --cuda-graphs
+
+# Custom asymmetric pair (RL imbalance)
+docker exec $ENVS $CONTAINER torchrun --nproc_per_node=8 \
+    $BENCH/benchmark_dp_attn.py \
+    --distribution custom \
+    --dp0-reqs 20 --dp0-total-kv 1200000 \
+    --dp1-reqs 15 --dp1-total-kv 200000 \
+    --trials 50 --warmup 10 --cuda-graphs
+
+# Skewed per-request lengths (3 long 60k requests + 17 short)
+docker exec $ENVS $CONTAINER torchrun --nproc_per_node=8 \
+    $BENCH/benchmark_dp_attn.py \
+    --distribution custom \
+    --dp0-reqs 20 --dp0-total-kv 800000 --dp0-skew-long 3 \
+    --dp1-reqs 20 --dp1-total-kv 800000 --dp1-skew-long 3 \
+    --trials 50 --warmup 10 --cuda-graphs
+```
+
+### Grid sweep (RL-scale configs)
+
+Each config runs as a separate torchrun process (clean global state):
+```bash
+docker exec $ENVS $CONTAINER python $BENCH/run_grid.py \
+    --trials 50 --warmup 10 --cuda-graphs
+```
+
+### nsys profiling
+
+To inspect the GPU timeline and confirm kernel-level behavior:
+```bash
+# Without CUDA graphs (see Python/launch overhead)
+docker exec $ENVS $CONTAINER nsys profile \
+    --stats=true --force-overwrite=true -t cuda -o /tmp/dp_bench_eager \
+    torchrun --nproc_per_node=8 $BENCH/benchmark_dp_attn.py \
+    --distribution custom \
+    --dp0-reqs 30 --dp0-total-kv 25000 \
+    --dp1-reqs 30 --dp1-total-kv 200000 \
+    --trials 5 --warmup 5
+
+# With CUDA graphs (--cuda-graph-trace=node to see inside replays)
+docker exec $ENVS $CONTAINER nsys profile \
+    --cuda-graph-trace=node --stats=true --force-overwrite=true -t cuda \
+    -o /tmp/dp_bench_cg \
+    torchrun --nproc_per_node=8 $BENCH/benchmark_dp_attn.py \
+    --distribution custom \
+    --dp0-reqs 30 --dp0-total-kv 25000 \
+    --dp1-reqs 30 --dp1-total-kv 200000 \
+    --trials 5 --warmup 5 --cuda-graphs
+```
+
+The `.nsys-rep` file can be opened in Nsight Systems GUI.
+The `--stats=true` flag prints a kernel summary table to stdout.
+
+### Key flags
+
+| Flag | Description |
+|------|-------------|
+| `--cuda-graphs` | Capture into CUDA graphs (eliminates ~55 us Python/launch overhead) |
+| `--distribution custom` | Specify DP0/DP1 configs independently |
+| `--dp0-skew-long N` | N requests get 60k tokens, rest split the remainder evenly |
+| `--trials N` | Number of timed iterations per component (default 100) |
+| `--warmup N` | Warmup iterations before timing (default 20) |
+| `--backend` | FLASH_ATTN (default), FLASHINFER, TRITON_ATTN |
