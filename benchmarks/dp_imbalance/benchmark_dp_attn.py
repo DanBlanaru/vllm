@@ -83,14 +83,25 @@ class DPScenario:
     label: str
     num_reqs: int
     kv_lens: list
+    q_lens: list = None
 
     @property
     def total_kv(self):
         return sum(self.kv_lens)
 
     @property
+    def total_q(self):
+        if self.q_lens is not None:
+            return sum(self.q_lens)
+        return self.num_reqs
+
+    @property
     def avg_kv(self):
         return self.total_kv / self.num_reqs if self.num_reqs else 0
+
+    @property
+    def is_prefill(self):
+        return self.q_lens is not None and any(q > 1 for q in self.q_lens)
 
 
 def get_scenarios(distribution):
@@ -126,6 +137,23 @@ def _make_scenario(num_reqs, total_kv, label="", skew_long=0):
         per_req = total_kv // num_reqs
         kv_lens = [per_req] * num_reqs
     return DPScenario(label or f"{num_reqs}rq", num_reqs, kv_lens)
+
+
+def _make_prefill_scenario(prefill_isls, decode_kv_lens=None, label=""):
+    """Create a scenario with prefill and optional decode requests.
+
+    Args:
+        prefill_isls: list of ISL values (q_len = kv_len = ISL per request).
+        decode_kv_lens: optional list of KV lengths for decode requests
+            (q_len=1 each), appended after the prefill requests.
+    """
+    q_lens = list(prefill_isls)
+    kv_lens = list(prefill_isls)
+    if decode_kv_lens:
+        q_lens.extend([1] * len(decode_kv_lens))
+        kv_lens.extend(decode_kv_lens)
+    num_reqs = len(q_lens)
+    return DPScenario(label or f"{num_reqs}rq", num_reqs, kv_lens, q_lens)
 
 
 # =====================================================================
@@ -179,7 +207,8 @@ def time_cuda_us(fn, warmup=10, trials=50, sync_group=None):
 # vLLM attention setup
 # =====================================================================
 
-def _make_vllm_config(cfg, max_kv, max_num_blocks, kv_cache_dtype):
+def _make_vllm_config(cfg, max_kv, max_num_blocks, kv_cache_dtype,
+                      total_q=0):
     from vllm.config import (
         CacheConfig, CompilationConfig, DeviceConfig, LoadConfig,
         ModelConfig as VllmModelConfig, ParallelConfig, SchedulerConfig,
@@ -212,7 +241,7 @@ def _make_vllm_config(cfg, max_kv, max_num_blocks, kv_cache_dtype):
         parallel_config=ParallelConfig(tensor_parallel_size=1),
         scheduler_config=SchedulerConfig(
             max_num_seqs=256,
-            max_num_batched_tokens=max(max_kv, 8192),
+            max_num_batched_tokens=max(max_kv, total_q, 8192),
             max_model_len=max(max_kv, 8192),
             is_encoder_decoder=False, enable_chunked_prefill=True,
         ),
@@ -223,10 +252,11 @@ def _make_vllm_config(cfg, max_kv, max_num_blocks, kv_cache_dtype):
 
 def setup_attention(cfg, scenario, backend_name, kv_cache_dtype, device):
     """
-    Set up vLLM AttentionImpl for decode.
+    Set up vLLM AttentionImpl for decode or prefill.
 
     The KV cache is zero-filled. seq_lens = kv_lens so the kernel reads
-    kv_lens[i] tokens per request -- accurate decode bandwidth cost.
+    kv_lens[i] tokens per request. For prefill, q_lens[i] = ISL so the
+    kernel processes ISL query tokens against kv_lens[i] KV tokens.
     """
     from runner import (
         _build_common_attn_metadata, _create_backend_impl,
@@ -237,7 +267,9 @@ def setup_attention(cfg, scenario, backend_name, kv_cache_dtype, device):
     from vllm.config import set_current_vllm_config
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
-    q_lens = [1] * scenario.num_reqs
+    q_lens = (scenario.q_lens if scenario.q_lens is not None
+              else [1] * scenario.num_reqs)
+    total_q = sum(q_lens)
     max_kv = max(scenario.kv_lens)
     block_size = 16
     max_blk = (max_kv + block_size - 1) // block_size
@@ -254,7 +286,8 @@ def setup_attention(cfg, scenario, backend_name, kv_cache_dtype, device):
 
     bcfg = _get_backend_config(backend_name)
     with log_warnings_and_errors_only():
-        vcfg = _make_vllm_config(cfg, max_kv, total_blocks, kv_cache_dtype)
+        vcfg = _make_vllm_config(cfg, max_kv, total_blocks,
+                                 kv_cache_dtype, total_q=total_q)
         dtype = vcfg.model_config.dtype
         with set_current_vllm_config(vcfg):
             backend_class, impl, layer = _create_backend_impl(
@@ -292,7 +325,7 @@ def _benchmark_scenario(cfg, scenario, args, device, tp_group):
     from vllm.config import set_current_vllm_config
 
     dtype = torch.bfloat16
-    n = scenario.num_reqs
+    tq = scenario.total_q
     q_dim = cfg.q_out_dim
     kv_dim = cfg.num_kv_heads * cfg.head_dim
 
@@ -300,22 +333,22 @@ def _benchmark_scenario(cfg, scenario, args, device, tp_group):
                        bias=False, dtype=dtype, device=device)
     o_w = nn.Linear(q_dim, cfg.hidden_size,
                      bias=False, dtype=dtype, device=device)
-    hidden = torch.randn(n, cfg.hidden_size, device=device, dtype=dtype)
+    hidden = torch.randn(tq, cfg.hidden_size, device=device, dtype=dtype)
 
     impl, layer, kv_cache, attn_meta, mdtype, vcfg = setup_attention(
         cfg, scenario, args.backend, args.kv_cache_dtype, device)
 
-    attn_out = torch.empty(n, cfg.num_q_heads, cfg.head_dim,
+    attn_out = torch.empty(tq, cfg.num_q_heads, cfg.head_dim,
                            device=device, dtype=mdtype)
-    ar_buf = torch.empty(n, cfg.hidden_size, device=device, dtype=dtype)
+    ar_buf = torch.empty(tq, cfg.hidden_size, device=device, dtype=dtype)
 
     qkv_raw = torch.nn.functional.linear(hidden, qkv_w.weight)
     q_bench = qkv_raw[:, :q_dim].view(
-        n, cfg.num_q_heads, cfg.head_dim).clone()
+        tq, cfg.num_q_heads, cfg.head_dim).clone()
     k_bench = qkv_raw[:, q_dim:q_dim + kv_dim].view(
-        n, cfg.num_kv_heads, cfg.head_dim).clone()
+        tq, cfg.num_kv_heads, cfg.head_dim).clone()
     v_bench = qkv_raw[:, q_dim + kv_dim:].view(
-        n, cfg.num_kv_heads, cfg.head_dim).clone()
+        tq, cfg.num_kv_heads, cfg.head_dim).clone()
     del qkv_raw
 
     def fn_qkv():
@@ -326,21 +359,21 @@ def _benchmark_scenario(cfg, scenario, args, device, tp_group):
                      kv_cache, attn_meta, output=attn_out)
 
     def fn_o_proj():
-        torch.nn.functional.linear(attn_out.view(n, q_dim), o_w.weight)
+        torch.nn.functional.linear(attn_out.view(tq, q_dim), o_w.weight)
 
     def fn_allreduce():
         dist.all_reduce(ar_buf, group=tp_group)
 
     def fn_total():
         qkv = torch.nn.functional.linear(hidden, qkv_w.weight)
-        q = qkv[:, :q_dim].view(n, cfg.num_q_heads, cfg.head_dim)
+        q = qkv[:, :q_dim].view(tq, cfg.num_q_heads, cfg.head_dim)
         k = qkv[:, q_dim:q_dim + kv_dim].view(
-            n, cfg.num_kv_heads, cfg.head_dim)
+            tq, cfg.num_kv_heads, cfg.head_dim)
         v = qkv[:, q_dim + kv_dim:].view(
-            n, cfg.num_kv_heads, cfg.head_dim)
+            tq, cfg.num_kv_heads, cfg.head_dim)
         impl.forward(layer, q, k, v, kv_cache, attn_meta, output=attn_out)
         out = torch.nn.functional.linear(
-            attn_out.view(n, q_dim), o_w.weight)
+            attn_out.view(tq, q_dim), o_w.weight)
         dist.all_reduce(out, group=tp_group)
 
     with set_current_vllm_config(vcfg):
@@ -483,24 +516,39 @@ def run_benchmark(args):
         _print_header(cfg, args, world_size, dp_size, tp_size)
 
     if args.distribution == "custom":
-        dp0_sc = _make_scenario(
-            args.dp0_reqs, args.dp0_total_kv, "DP0",
-            skew_long=args.dp0_skew_long)
-        dp1_sc = _make_scenario(
-            args.dp1_reqs, args.dp1_total_kv, "DP1",
-            skew_long=args.dp1_skew_long)
+        if args.dp0_prefill_isls:
+            isls = [int(x) for x in args.dp0_prefill_isls.split(",")]
+            dkvs = ([int(x) for x in args.dp0_decode_kvs.split(",")]
+                    if args.dp0_decode_kvs else None)
+            dp0_sc = _make_prefill_scenario(isls, dkvs, "DP0")
+        else:
+            dp0_sc = _make_scenario(
+                args.dp0_reqs, args.dp0_total_kv, "DP0",
+                skew_long=args.dp0_skew_long)
+        if args.dp1_prefill_isls:
+            isls = [int(x) for x in args.dp1_prefill_isls.split(",")]
+            dkvs = ([int(x) for x in args.dp1_decode_kvs.split(",")]
+                    if args.dp1_decode_kvs else None)
+            dp1_sc = _make_prefill_scenario(isls, dkvs, "DP1")
+        else:
+            dp1_sc = _make_scenario(
+                args.dp1_reqs, args.dp1_total_kv, "DP1",
+                skew_long=args.dp1_skew_long)
     else:
         dp0_sc, dp1_sc = get_scenarios(args.distribution)
 
     scenario = dp0_sc if dp_rank == 0 else dp1_sc
 
     if rank == 0:
-        print(f"\n  DP0: {dp0_sc.num_reqs} reqs   "
-              f"{dp0_sc.total_kv:,} KV tokens  "
-              f"(avg {dp0_sc.avg_kv:.0f})")
-        print(f"  DP1: {dp1_sc.num_reqs} reqs   "
-              f"{dp1_sc.total_kv:,} KV tokens  "
-              f"(avg {dp1_sc.avg_kv:.0f})")
+        def _sc_desc(sc):
+            desc = (f"{sc.num_reqs} reqs   "
+                    f"{sc.total_kv:,} KV tokens  "
+                    f"(avg {sc.avg_kv:.0f})")
+            if sc.is_prefill:
+                desc += f"  total_q={sc.total_q:,}"
+            return desc
+        print(f"\n  DP0: {_sc_desc(dp0_sc)}")
+        print(f"  DP1: {_sc_desc(dp1_sc)}")
         print(f"\n  Warming up + running {args.trials} "
               f"trials per component...\n")
 
@@ -561,6 +609,18 @@ def main():
                              "(rest split remaining KV evenly)")
     parser.add_argument("--dp1-skew-long", type=int, default=0,
                         help="Number of 60k-token long requests in DP1")
+    parser.add_argument("--dp0-prefill-isls", type=str, default=None,
+                        help="Comma-separated ISL per prefill request "
+                             "for DP0 (e.g. '4000,4000')")
+    parser.add_argument("--dp1-prefill-isls", type=str, default=None,
+                        help="Comma-separated ISL per prefill request "
+                             "for DP1")
+    parser.add_argument("--dp0-decode-kvs", type=str, default=None,
+                        help="Comma-separated KV per decode request "
+                             "for DP0 (appended to prefill reqs)")
+    parser.add_argument("--dp1-decode-kvs", type=str, default=None,
+                        help="Comma-separated KV per decode request "
+                             "for DP1")
     parser.add_argument("--cuda-graphs", action="store_true",
                         help="Capture into CUDA graphs to eliminate "
                              "Python/launch overhead")
