@@ -1,148 +1,143 @@
----
-name: Prefill DP Imbalance Benchmark
-overview: Extend the DP attention benchmark to support prefill workloads, quantify the cost of prefill/decode imbalance (what TRT-LLM's ADP Balance addresses), and measure how ISL distribution affects runtime for the same total token count.
-todos:
-  - id: p1
-    content: Extend DPScenario with q_lens field and add _make_prefill_scenario helper
-    status: pending
-  - id: p2
-    content: Modify _benchmark_scenario to use total_q for tensor shapes and pass q_lens to setup_attention
-    status: pending
-  - id: p3
-    content: Add prefill CLI args (--dp0-isls, --dp0-decode-kvs, etc.)
-    status: pending
-  - id: p4
-    content: Add prefill grid configs to run_grid.py (ISL distribution + prefill-vs-decode imbalance)
-    status: pending
-  - id: p5
-    content: Run prefill ISL distribution grid
-    status: pending
-  - id: p6
-    content: Run prefill-vs-decode imbalance scenarios and compare with balanced (context wait)
-    status: pending
-  - id: p7
-    content: Update plan document with prefill results
-    status: pending
-isProject: false
----
-
 # Prefill DP Imbalance Benchmark Extension
 
 ## Background
 
-The decode benchmark showed attention scales linearly with total KV and is insensitive to per-request distribution. For prefill, the story is fundamentally different: attention compute is O(q_len x kv_len) per request, so for pure prefill (q_len = ISL, kv_len = ISL) the cost is O(ISL^2). This means:
+The decode benchmark showed attention scales linearly with total KV and is insensitive
+to per-request distribution. For prefill, the story is fundamentally different: attention
+compute is O(q_len x kv_len) per request, so for pure prefill (q_len = ISL, kv_len = ISL)
+the cost is O(ISL^2). This means:
 
 - **4 reqs x 2k ISL** = 4 x 2k x 2k = **16M attention FLOPs**
 - **1 req x 8k ISL** = 1 x 8k x 8k = **64M attention FLOPs**
 
-Same total tokens (8k), but **4x more compute** for the single long request. This is the opposite of decode where distribution doesn't matter.
+Same total tokens (8k), but **4x more compute** for the single long request. This is the
+opposite of decode where distribution doesn't matter.
 
-TRT-LLM's [ADP Balance Strategy](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog10_ADP_Balance_Strategy.md) addresses a different axis: the imbalance when one DP rank does prefill (expensive) while another does decode (cheap). Their "context wait" delays prefill until all ranks can do it together, achieving 33% throughput improvement at the cost of TTFT.
+TRT-LLM's [ADP Balance Strategy](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog10_ADP_Balance_Strategy.md)
+addresses the imbalance when one DP rank does prefill while another does decode. Their
+"context wait" delays prefill until all ranks can do it together, achieving 33% throughput
+improvement at the cost of TTFT.
 
-## What We Want to Measure
+## Implementation
 
-### Part 1: Prefill vs Decode imbalance (quantify ADP Balance benefit)
+Extended `benchmark_dp_attn.py` with prefill support:
 
-One DP rank processes a prefill request while the other does only decode. This is the worst-case imbalance that ADP Balance eliminates.
+- `DPScenario.q_lens`: optional per-request query lengths (None = decode, all 1s)
+- `_make_prefill_scenario(prefill_isls, decode_kv_lens)`: creates mixed prefill+decode batches
+- All tensor shapes use `total_q = sum(q_lens)` instead of `num_reqs`
+- `setup_attention` passes `q_lens` to metadata builder (ragged query batching)
 
-Example scenarios (with 20 concurrent requests at ~600k total KV per rank):
+Grid runner: `run_prefill_grid.py` with ISL distribution sweep and prefill-vs-decode pairs.
 
-- **Imbalanced**: DP0 = 1 prefill (ISL=4k) + 19 decode (KV=30k), DP1 = 20 decode (KV=30k)
-- **Balanced (context wait)**: DP0 = 1 prefill (ISL=4k) + 19 decode, DP1 = 1 prefill (ISL=4k) + 19 decode
-- The gap between these quantifies the benefit of coordinated scheduling.
+Total query tokens per DP rank capped at ~8k-16k (vLLM's `max_num_batched_tokens`).
 
-### Part 2: Prefill ISL distribution effects
+## Results: 8x H200, FLASH_ATTN, bf16, CUDA graphs, 50 trials (median)
 
-For the same total prefill tokens, how does splitting across requests affect runtime?
+### Part 1: ISL distribution -- prefill cost is O(ISL^2)
 
-- 1 x 8k ISL vs 2 x 4k vs 4 x 2k vs 8 x 1k (all = 8k total tokens)
-- 1 x 16k vs 4 x 4k vs 16 x 1k (all = 16k total tokens)
-- This tests whether FA3/FA4's CTA scheduling can hide the O(ISL^2) cost through parallelism.
-
-## Code Changes
-
-### 1. Extend `DPScenario` and `_make_scenario` in `benchmark_dp_attn.py`
-
-Currently `q_lens` is hardcoded to `[1] * num_reqs` (decode). Add a `q_lens` field:
-
-```python
-@dataclass
-class DPScenario:
-    label: str
-    num_reqs: int
-    kv_lens: list
-    q_lens: list = None  # None -> decode (all 1s)
-
-    @property
-    def total_q(self):
-        return sum(self.q_lens) if self.q_lens else self.num_reqs
-```
-
-Add `_make_prefill_scenario(num_reqs, isl_list, decode_kv_lens=None)`:
-
-- `isl_list`: ISL per prefill request (q_len = kv_len = ISL for pure prefill)
-- `decode_kv_lens`: optional list of KV lengths for additional decode requests in the same batch (mixed prefill+decode)
-
-### 2. Modify `_benchmark_scenario` for variable `total_q`
-
-Key shape changes when `total_q != num_reqs`:
-
-
-| Tensor                          | Decode (`total_q = n`) | Prefill (`total_q >> n`)  |
-| ------------------------------- | ---------------------- | ------------------------- |
-| `hidden`                        | `[n, hidden_size]`     | `[total_q, hidden_size]`  |
-| `q_bench`, `k_bench`, `v_bench` | `[n, heads, dim]`      | `[total_q, heads, dim]`   |
-| `attn_out`                      | `[n, q_heads, dim]`    | `[total_q, q_heads, dim]` |
-| `ar_buf` / O-proj output        | `[n, hidden_size]`     | `[total_q, hidden_size]`  |
-
-
-The `setup_attention` function already accepts arbitrary `q_lens` via `_build_common_attn_metadata` -- just pass the scenario's `q_lens` instead of `[1]*n`.
-
-### 3. Add prefill CLI args
-
-- `--dp0-isls`: comma-separated ISL per prefill request (e.g., `"4000,4000,4000"`)
-- `--dp0-decode-kvs`: comma-separated KV per decode request in the same batch
-- Same for dp1
-
-### 4. Add prefill grid configs in `run_grid.py`
-
-New grid groups:
+Same total_q (total query tokens), different splits. Both DP ranks run the same config.
 
 ```
-Prefill ISL distribution (total_tokens = 8k)
-  1 x 8000 ISL
-  2 x 4000 ISL  
-  4 x 2000 ISL
-  8 x 1000 ISL
+  ISL distribution (total_q = 4k)
+      config   reqs  total_q  qkv_proj      attn    o_proj allreduce     total
+  ────────────────────────────────────────────────────────────────────────────
+        1x4k      1     4000     102.2     115.7      88.1     170.9     476.4
+        2x2k      2     4000     102.4      72.2      88.1     171.0     433.6
+        4x1k      4     4000     102.5      51.5      88.2     171.3     413.0
+       8x500      8     4000     102.3      42.1      88.1     171.0     402.8
 
-Prefill ISL distribution (total_tokens = 16k)
-  1 x 16000 ISL
-  2 x 8000 ISL
-  4 x 4000 ISL
-  8 x 2000 ISL
-  16 x 1000 ISL
+  ISL distribution (total_q = 8k)
+      config   reqs  total_q  qkv_proj      attn    o_proj allreduce     total
+  ────────────────────────────────────────────────────────────────────────────
+        1x8k      1     8000     199.8     394.7     166.3     317.6    1075.2
+        2x4k      2     8000     200.1     221.0     166.3     317.7     901.2
+        4x2k      4     8000     199.8     134.0     166.2     317.4     813.7
+        8x1k      8     8000     199.7      91.1     166.3     317.6     770.9
 
-Prefill vs Decode imbalance (20 reqs, ~600k decode KV)
-  DP0: 1 prefill (ISL=2k) + 19 decode    vs  DP1: 20 decode
-  DP0: 1 prefill (ISL=4k) + 19 decode    vs  DP1: 20 decode
-  DP0: 1 prefill (ISL=8k) + 19 decode    vs  DP1: 20 decode
-  DP0: 3 prefill (ISL=4k) + 17 decode    vs  DP1: 20 decode
-
-Balanced (simulated context wait)
-  DP0: 1 prefill (ISL=4k) + 19 decode    vs  DP1: 1 prefill (ISL=4k) + 19 decode
+  ISL distribution (total_q = 16k)
+      config   reqs  total_q  qkv_proj      attn    o_proj allreduce     total
+  ────────────────────────────────────────────────────────────────────────────
+       1x16k      1    16000     393.8    1487.0     325.6     603.6    2790.3
+        2x8k      2    16000     393.8     789.7     324.7     602.6    2097.9
+        4x4k      4    16000     393.5     451.2     325.7     602.3    1747.4
+        8x2k      8    16000     393.7     268.2     330.5     602.8    1572.8
+       16x1k     16    16000     393.6     173.5     327.2     602.6    1482.3
 ```
 
-### 5. CUDA graph handling
+**Attention scales as O(ISL^2)**: 1x8k is 4.3x slower than 8x1k for the same total_q.
+QKV, O, allreduce are constant (depend only on total_q, not distribution).
 
-CUDA graphs work for fixed shapes. Since each grid config runs as a separate `torchrun` process, each captures its own graph with the correct `total_q`. No bucketing needed.
+For balanced prefill scheduling, the optimization target is:
+**minimize max(sum(ISL_i^2) per DP rank)**, not just total tokens.
 
-However, for **asymmetric prefill vs decode pairs**, DP0 and DP1 have different `total_q` values. Each GPU captures its own graph with its own shapes, which is fine -- the graph is per-GPU.
+### Part 2: Prefill vs decode imbalance
 
-## Execution Plan
+One DP rank processes prefill+decode, the other decode only.
+19-20 decode requests x 30k KV each (~570-600k total decode KV per rank).
 
-1. Implement the code changes (scenario, benchmark, CLI, grid)
-2. Run prefill-only grid (ISL distribution effects) with `--cuda-graphs`
-3. Run prefill-vs-decode imbalance scenarios
-4. Compare imbalanced vs balanced (context wait) pairs
-5. Update the plan document with results and analysis
+```
+  Prefill vs decode imbalance (DP0=prefill+decode, DP1=decode-only)
+  Scenario                                         DP0 total   DP1 total   Gap
+  ─────────────────────────────────────────────────────────────────────────────
+  DP0: 1x2k pfill + 19 dec  vs  DP1: 20 dec         595.8       124.2     471.5 us
+  DP0: 1x4k pfill + 19 dec  vs  DP1: 20 dec         829.7       123.6     706.0 us
+  DP0: 1x8k pfill + 19 dec  vs  DP1: 20 dec        1425.9       123.2    1302.7 us
+  DP0: 3x4k pfill + 17 dec  vs  DP1: 20 dec        1671.7       123.9    1547.7 us
+```
 
+A single 8k-ISL prefill makes the DP rank **11.5x slower**. Over 94 layers:
+**1302.7 us x 94 = 122 ms/forward wasted**. A 64k prefill would waste ~2.7 seconds.
+
+### Part 3: Balanced prefill (simulated context wait)
+
+Both DP ranks do prefill simultaneously (TRT-LLM's "context wait" strategy):
+
+```
+  Balanced prefill (both ranks prefill simultaneously)
+  Scenario                                         DP0 total   DP1 total   Gap
+  ─────────────────────────────────────────────────────────────────────────────
+  Both: 1x4k pfill + 19 dec                         828.5       830.2       1.7 us
+  Both: 1x8k pfill + 19 dec                        1425.3      1427.1       1.7 us
+```
+
+**Gap drops to noise** (~2 us). Context wait fully eliminates prefill imbalance.
+
+## Key Findings
+
+1. **Prefill attention cost is O(ISL^2)**, unlike decode where it's O(total_kv).
+   Distribution across requests matters: 1x8k costs 4.3x more than 8x1k at the
+   same total_q. The optimization target for prefill balancing is sum(ISL_i^2),
+   not sum(ISL_i).
+
+2. **Prefill vs decode imbalance is massive**: a single 8k-ISL prefill wastes
+   122 ms/forward (1303 us/layer x 94 layers). This dwarfs decode imbalance
+   (11 ms at worst case).
+
+3. **Context wait eliminates prefill imbalance completely**: when both ranks
+   prefill simultaneously, the gap is < 2 us. The cost is increased TTFT.
+
+4. **Projections and allreduce scale linearly with total_q** (not ISL^2):
+   QKV ~25 us per 1k tokens, O ~21 us per 1k tokens, allreduce ~40 us per 1k tokens.
+   These are balanced as long as total_q is balanced.
+
+5. **Unified optimization metric**: attention cost per request = q_len_i x kv_len_i.
+   For prefill: q=kv=ISL, so cost = ISL^2. For decode: q=1, so cost = kv_len.
+   Balance sum(q_i * kv_i) across DP ranks.
+
+## Reproducing
+
+```bash
+# Prefill grid (ISL distribution + imbalance)
+docker exec -e HF_HOME=/scratch/bench_serving/hf_cache -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    $CONTAINER python /scratch/bench_serving/vllm/benchmarks/dp_imbalance/run_prefill_grid.py \
+    --trials 50 --warmup 10 --cuda-graphs --part all
+
+# Single prefill pair
+docker exec -e HF_HOME=/scratch/bench_serving/hf_cache -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    $CONTAINER torchrun --nproc_per_node=8 \
+    /scratch/bench_serving/vllm/benchmarks/dp_imbalance/benchmark_dp_attn.py \
+    --distribution custom \
+    --dp0-prefill-isls 4000,4000 --dp0-decode-kvs 30000,30000,30000 \
+    --dp1-prefill-isls 4000,4000 --dp1-decode-kvs 30000,30000,30000 \
+    --trials 50 --warmup 10 --cuda-graphs
+```

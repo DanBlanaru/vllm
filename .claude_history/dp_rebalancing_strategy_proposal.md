@@ -13,18 +13,42 @@ multi-layered rebalancing strategy informed by kernel-level measurements.
 ### 1. Prefill vs decode mismatch (largest: 122 ms - 2.7 s per forward)
 
 When one DP rank receives a new request (prefill) while the other only decodes,
-the prefill rank is dramatically slower:
+the prefill rank is dramatically slower. Decode baseline: 20 requests x 30k KV
+each = 600k total KV per rank (124 us/layer, matching the decode grid at 600k).
 
-| Scenario (per layer) | Prefill rank | Decode rank | Gap | x 94 layers |
+| Scenario (per layer) | Prefill rank | Decode rank (20rq x 30k KV) | Gap | x 94 layers |
 |---|---|---|---|---|
-| 1 req x 2k ISL + 19 decode | 596 us | 124 us | 472 us | 44 ms |
-| 1 req x 4k ISL + 19 decode | 830 us | 124 us | 706 us | 66 ms |
-| 1 req x 8k ISL + 19 decode | 1,426 us | 124 us | 1,303 us | **122 ms** |
-| 3 reqs x 4k ISL + 17 decode | 1,672 us | 124 us | 1,548 us | 145 ms |
+| 1 req x 2k ISL + 19 decode (30k KV each) | 596 us | 124 us | 472 us | 44 ms |
+| 1 req x 4k ISL + 19 decode (30k KV each) | 830 us | 124 us | 706 us | 66 ms |
+| 1 req x 8k ISL + 19 decode (30k KV each) | 1,426 us | 124 us | 1,303 us | **122 ms** |
+| 3 reqs x 4k ISL + 17 decode (30k KV each) | 1,672 us | 124 us | 1,548 us | 145 ms |
 
-Prefill attention is O(ISL^2) per request. A single 64k-ISL request
-(extrapolated) would cost ~29 ms/layer, wasting ~2.7 seconds while the
-decode-only rank sits idle after finishing in ~12 ms.
+Prefill attention is O(ISL^2) per request. Extrapolating from measured data
+points (attention kernel only, us):
+
+```
+  ISL      Measured    Theoretical (ISL/4k)^2 * 115.7
+  4k         115.7     115.7   (baseline)
+  8k         394.7     462.8   (measured is faster: kernel overhead amortization)
+  16k       1487.0    1851.2
+  32k       ~5950*    7404.8   (*extrapolated 4x from 16k)
+  64k      ~23800*   29619.2   (*extrapolated 4x from 32k)
+```
+
+Adding projections and allreduce (which scale linearly with total_q):
+- QKV: ~25 us per 1k tokens -> 64k = ~1,600 us
+- O proj: ~21 us per 1k tokens -> 64k = ~1,340 us
+- Allreduce: ~40 us per 1k tokens -> 64k = ~2,560 us
+- Total per layer for 1x64k prefill: ~23,800 + 1,600 + 1,340 + 2,560 = **~29,300 us**
+
+Over 94 layers: 29,300 us x 94 = **2.75 seconds** for the prefill rank.
+The decode-only rank (20 reqs, 600k KV): 124 us/layer x 94 = **11.7 ms**.
+Gap: 2.75 s - 0.012 s = **~2.7 seconds wasted** per forward pass.
+
+Note: in practice, vLLM uses chunked prefill (max ~8k tokens per chunk) which
+spreads the 64k prefill across ~8 iterations. Each chunk's attention cost is
+O(chunk_size x accumulated_kv), so early chunks are cheap (~8k x 8k) and later
+chunks are expensive (~8k x 64k). The total work is the same but amortized.
 
 **Context wait eliminates this entirely**: when both ranks prefill simultaneously,
 the gap drops to < 2 us. TRT-LLM reports 33% throughput improvement with this
@@ -34,9 +58,14 @@ strategy on DeepSeek V3.
 
 When both ranks decode but one has more total KV tokens:
 
-| Light rank (200k KV) | Heavy rank (1.2M KV) | Gap | x 94 layers |
-|---|---|---|---|
-| 75 us/layer | 200 us/layer | 125 us | 11.4 ms |
+|  | Light rank (200k KV) | Heavy rank (1.2M KV) | Gap | x 94 layers |
+|---|---|---|---|---|
+| Attention only | 39 us | 160 us | 121 us | 11.4 ms |
+| Total (QKV+attn+O+AR) | 75 us | 200 us | 125 us | 11.8 ms |
+
+The gap is almost entirely from the attention kernel (121 of 125 us).
+Projections and allreduce contribute < 4 us because they depend on batch
+size / num tokens (20 reqs = 20 tokens for decode), not KV cache size.
 
 Decode attention scales linearly with total KV (~24 us per 200k tokens on H200).
 Per-request KV distribution is irrelevant -- only the sum matters. FA3's split-K
@@ -45,14 +74,19 @@ of how it's split across requests.
 
 ### 3. Prefill ISL distribution (moderate: within single-rank scheduling)
 
-For the same total prefill tokens, long requests cost quadratically more:
+For the same total prefill tokens, long requests cost quadratically more.
+These are **attention kernel times only** (projections and allreduce are constant
+at ~200 us / ~166 us / ~318 us since total_q is the same across all configs):
 
-| Config (total_q = 8k) | Attention | Ratio vs 8x1k |
+| Config (total_q = 8k) | Attention only | Ratio vs 8x1k |
 |---|---|---|
 | 1 x 8k ISL | 395 us | 4.3x |
 | 2 x 4k ISL | 221 us | 2.4x |
 | 4 x 2k ISL | 134 us | 1.5x |
 | 8 x 1k ISL | 91 us | 1.0x |
+
+Total layer time ranges from 771 us (8x1k) to 1075 us (1x8k) -- the 304 us
+difference is purely from the attention kernel's O(ISL^2) scaling.
 
 This means balancing total prefill tokens across ranks is not enough.
 The optimization target is **sum(ISL_i^2)**, not sum(ISL_i).

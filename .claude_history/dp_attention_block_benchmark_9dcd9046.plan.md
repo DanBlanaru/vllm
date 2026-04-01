@@ -204,31 +204,29 @@ Container: vllm-openai with FLASH_ATTN backend, bf16 KV cache.
 - `vllm/benchmarks/dp_imbalance/run_grid.py` -- grid runner (spawns torchrun per config)
 
 **Environment variables** (required for configs with per-request KV > 8192):
-```bash
-export ENVS="-e HF_HOME=/scratch/bench_serving/hf_cache -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1"
-export CONTAINER=epic_sanderson  # adjust to your container name
-export BENCH=/scratch/bench_serving/vllm/benchmarks/dp_imbalance
-```
 
 ### Single pair run
 
 ```bash
 # Uniform (original scenario)
-docker exec $ENVS $CONTAINER torchrun --nproc_per_node=8 \
-    $BENCH/benchmark_dp_attn.py \
+docker exec -e HF_HOME=/scratch/bench_serving/hf_cache -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    $CONTAINER torchrun --nproc_per_node=8 \
+    /scratch/bench_serving/vllm/benchmarks/dp_imbalance/benchmark_dp_attn.py \
     --distribution uniform --trials 100 --cuda-graphs
 
 # Custom asymmetric pair (RL imbalance)
-docker exec $ENVS $CONTAINER torchrun --nproc_per_node=8 \
-    $BENCH/benchmark_dp_attn.py \
+docker exec -e HF_HOME=/scratch/bench_serving/hf_cache -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    $CONTAINER torchrun --nproc_per_node=8 \
+    /scratch/bench_serving/vllm/benchmarks/dp_imbalance/benchmark_dp_attn.py \
     --distribution custom \
     --dp0-reqs 20 --dp0-total-kv 1200000 \
     --dp1-reqs 15 --dp1-total-kv 200000 \
     --trials 50 --warmup 10 --cuda-graphs
 
 # Skewed per-request lengths (3 long 60k requests + 17 short)
-docker exec $ENVS $CONTAINER torchrun --nproc_per_node=8 \
-    $BENCH/benchmark_dp_attn.py \
+docker exec -e HF_HOME=/scratch/bench_serving/hf_cache -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    $CONTAINER torchrun --nproc_per_node=8 \
+    /scratch/bench_serving/vllm/benchmarks/dp_imbalance/benchmark_dp_attn.py \
     --distribution custom \
     --dp0-reqs 20 --dp0-total-kv 800000 --dp0-skew-long 3 \
     --dp1-reqs 20 --dp1-total-kv 800000 --dp1-skew-long 3 \
@@ -239,7 +237,8 @@ docker exec $ENVS $CONTAINER torchrun --nproc_per_node=8 \
 
 Each config runs as a separate torchrun process (clean global state):
 ```bash
-docker exec $ENVS $CONTAINER python $BENCH/run_grid.py \
+docker exec -e HF_HOME=/scratch/bench_serving/hf_cache -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    $CONTAINER python /scratch/bench_serving/vllm/benchmarks/dp_imbalance/run_grid.py \
     --trials 50 --warmup 10 --cuda-graphs
 ```
 
@@ -248,19 +247,23 @@ docker exec $ENVS $CONTAINER python $BENCH/run_grid.py \
 To inspect the GPU timeline and confirm kernel-level behavior:
 ```bash
 # Without CUDA graphs (see Python/launch overhead)
-docker exec $ENVS $CONTAINER nsys profile \
+docker exec -e HF_HOME=/scratch/bench_serving/hf_cache -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    $CONTAINER nsys profile \
     --stats=true --force-overwrite=true -t cuda -o /tmp/dp_bench_eager \
-    torchrun --nproc_per_node=8 $BENCH/benchmark_dp_attn.py \
+    torchrun --nproc_per_node=8 \
+    /scratch/bench_serving/vllm/benchmarks/dp_imbalance/benchmark_dp_attn.py \
     --distribution custom \
     --dp0-reqs 30 --dp0-total-kv 25000 \
     --dp1-reqs 30 --dp1-total-kv 200000 \
     --trials 5 --warmup 5
 
 # With CUDA graphs (--cuda-graph-trace=node to see inside replays)
-docker exec $ENVS $CONTAINER nsys profile \
+docker exec -e HF_HOME=/scratch/bench_serving/hf_cache -e VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 \
+    $CONTAINER nsys profile \
     --cuda-graph-trace=node --stats=true --force-overwrite=true -t cuda \
     -o /tmp/dp_bench_cg \
-    torchrun --nproc_per_node=8 $BENCH/benchmark_dp_attn.py \
+    torchrun --nproc_per_node=8 \
+    /scratch/bench_serving/vllm/benchmarks/dp_imbalance/benchmark_dp_attn.py \
     --distribution custom \
     --dp0-reqs 30 --dp0-total-kv 25000 \
     --dp1-reqs 30 --dp1-total-kv 200000 \
