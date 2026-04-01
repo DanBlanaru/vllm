@@ -107,18 +107,44 @@ def get_scenarios(distribution):
     raise ValueError(f"Unknown distribution: {distribution}")
 
 
-def _make_scenario(num_reqs, total_kv, label=""):
-    """Create a uniform DPScenario from (num_reqs, total_kv)."""
-    per_req = total_kv // num_reqs
-    return DPScenario(label or f"{num_reqs}rq", num_reqs, [per_req] * num_reqs)
+def _make_scenario(num_reqs, total_kv, label="", skew_long=0):
+    """Create a DPScenario from (num_reqs, total_kv).
+
+    Args:
+        skew_long: number of requests that get long context. The remaining
+            requests split the leftover KV evenly. If 0, all requests are
+            uniform.  Long requests get 60k tokens each (capped so total
+            doesn't exceed total_kv).
+    """
+    if skew_long > 0 and skew_long < num_reqs:
+        long_len = min(60_000, total_kv // skew_long)
+        long_total = long_len * skew_long
+        short_count = num_reqs - skew_long
+        short_len = max(1, (total_kv - long_total) // short_count)
+        kv_lens = [long_len] * skew_long + [short_len] * short_count
+    else:
+        per_req = total_kv // num_reqs
+        kv_lens = [per_req] * num_reqs
+    return DPScenario(label or f"{num_reqs}rq", num_reqs, kv_lens)
 
 
 # =====================================================================
 # Timing
 # =====================================================================
 
+def _capture_graph(fn):
+    """Capture fn into a CUDA graph and return its replay callable."""
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    return g.replay
+
+
 def time_cuda_us(fn, warmup=10, trials=50, sync_group=None):
-    """Returns (mean_us, std_us).
+    """Returns (median_us, iqr_us).
+
+    Reports median and inter-quartile range instead of mean/std to
+    filter out NCCL jitter outliers that inflate mean-based stats.
 
     Args:
         sync_group: If provided, a dist.barrier on this process group is
@@ -144,7 +170,9 @@ def time_cuda_us(fn, warmup=10, trials=50, sync_group=None):
         e.record()
         torch.cuda.synchronize()
         times.append(s.elapsed_time(e) * 1000.0)
-    return float(np.mean(times)), float(np.std(times))
+    p50 = float(np.median(times))
+    iqr = float(np.percentile(times, 75) - np.percentile(times, 25))
+    return p50, iqr
 
 
 # =====================================================================
@@ -321,6 +349,16 @@ def _benchmark_scenario(cfg, scenario, args, device, tp_group):
     torch.cuda.synchronize()
     dist.barrier(group=tp_group)
 
+    if args.cuda_graphs:
+        with set_current_vllm_config(vcfg):
+            fn_qkv = _capture_graph(fn_qkv)
+            fn_attn = _capture_graph(fn_attn)
+            fn_o_proj = _capture_graph(fn_o_proj)
+            fn_allreduce = _capture_graph(fn_allreduce)
+            fn_total = _capture_graph(fn_total)
+        torch.cuda.synchronize()
+        dist.barrier(group=tp_group)
+
     with set_current_vllm_config(vcfg):
         results = {
             "qkv_proj":  time_cuda_us(fn_qkv,       5, args.trials),
@@ -345,8 +383,9 @@ def _print_header(cfg, args, world_size, dp_size, tp_size):
     print(f"  {cfg.name}  |  DP Imbalance Attention Benchmark")
     print(f"{'=' * 90}")
     print(f"  Layout : {world_size} GPUs = {dp_size} DP x {tp_size} TP")
+    cg = "  CUDA graphs: ON" if args.cuda_graphs else ""
     print(f"  Backend: {args.backend}   KV dtype: {args.kv_cache_dtype}"
-          f"   GPU: {torch.cuda.get_device_name(0)}")
+          f"   GPU: {torch.cuda.get_device_name(0)}{cg}")
     print(f"  Per-GPU: Q={cfg.num_q_heads}h  KV={cfg.num_kv_heads}h"
           f"  d={cfg.head_dim}  hidden={cfg.hidden_size}")
     qkv_mb = cfg.hidden_size * cfg.qkv_out_dim * 2 / 1e6
@@ -445,9 +484,11 @@ def run_benchmark(args):
 
     if args.distribution == "custom":
         dp0_sc = _make_scenario(
-            args.dp0_reqs, args.dp0_total_kv, "DP0")
+            args.dp0_reqs, args.dp0_total_kv, "DP0",
+            skew_long=args.dp0_skew_long)
         dp1_sc = _make_scenario(
-            args.dp1_reqs, args.dp1_total_kv, "DP1")
+            args.dp1_reqs, args.dp1_total_kv, "DP1",
+            skew_long=args.dp1_skew_long)
     else:
         dp0_sc, dp1_sc = get_scenarios(args.distribution)
 
@@ -515,6 +556,14 @@ def main():
                         help="DP1 request count (custom mode)")
     parser.add_argument("--dp1-total-kv", type=int, default=50_000,
                         help="DP1 total KV tokens (custom mode)")
+    parser.add_argument("--dp0-skew-long", type=int, default=0,
+                        help="Number of 60k-token long requests in DP0 "
+                             "(rest split remaining KV evenly)")
+    parser.add_argument("--dp1-skew-long", type=int, default=0,
+                        help="Number of 60k-token long requests in DP1")
+    parser.add_argument("--cuda-graphs", action="store_true",
+                        help="Capture into CUDA graphs to eliminate "
+                             "Python/launch overhead")
     args = parser.parse_args()
     run_benchmark(args)
 
