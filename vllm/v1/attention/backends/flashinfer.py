@@ -15,7 +15,7 @@ from flashinfer import (
     MultiLevelCascadeAttentionWrapper,
 )
 from flashinfer.decode import fast_decode_plan, trtllm_batch_decode_with_kv_cache
-from flashinfer.prefill import trtllm_batch_context_with_kv_cache
+from flashinfer.prefill import trtllm_batch_context_with_kv_cache, trtllm_fmha_v2_prefill
 from flashinfer.utils import FP4Tensor
 from typing_extensions import override
 
@@ -24,7 +24,7 @@ from vllm import envs
 from vllm.config import (
     CUDAGraphMode,
     VllmConfig,
-    get_current_vllm_config_or_none,
+    get_current_vllm_config,
 )
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
@@ -603,7 +603,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self.logits_soft_cap = self.global_hyperparameters.logits_soft_cap
         self.has_sinks = self.global_hyperparameters.has_sinks
         self.has_spec = self.get_has_spec(vllm_config)
-
+        
         # Decide whether to use TRTLLM attention for prefill and decode.
         self.prefill_use_trtllm = use_trtllm_attention(
             is_prefill=True,
@@ -671,6 +671,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         cls, vllm_config: VllmConfig, kv_cache_spec: AttentionSpec
     ) -> torch.dtype:
         cache_dtype = vllm_config.cache_config.cache_dtype
+        
         if cache_dtype.startswith("fp8"):
             return FlashInferBackend.get_fp8_dtype_for_flashinfer(cache_dtype)
 
@@ -740,12 +741,12 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         has_sinks = False
         has_spec = cls.get_has_spec(vllm_config)
         decode_use_trtllm = use_trtllm_attention(
+            False,
             num_qo_heads,
             num_kv_heads,
             dcp_world_size,
             kv_cache_dtype,
             q_data_type,
-            False,
             has_sinks,
             has_spec,
             silent=True,
@@ -1385,7 +1386,7 @@ class FlashInferImpl(AttentionImpl):
 
         prefill_use_trtllm = isinstance(attn_metadata.prefill, TRTLLMPrefill)
         decode_use_trtllm = isinstance(attn_metadata.decode, TRTLLMDecode)
-
+        
         # The attn+quant fusion happens when output_scale is provided.
         if output_scale is None:
             assert output_block_scale is None, (
@@ -1461,10 +1462,9 @@ class FlashInferImpl(AttentionImpl):
         # because some decode requests may have more than one query token.
         num_decode_tokens = attn_metadata.num_decode_tokens
         num_prefill_tokens = attn_metadata.num_prefill_tokens
-
+      
         stride_order = FlashInferBackend.get_kv_cache_stride_order()
         kv_cache_permute = kv_cache.permute(*stride_order)
-
         use_dcp = self.dcp_world_size > 1
 
         # Regular attention (common case).
@@ -1479,7 +1479,7 @@ class FlashInferImpl(AttentionImpl):
                 attn_metadata.q_data_type_prefill,
                 layer._q_scale,
             )
-
+        
             if not prefill_use_trtllm:
                 assert isinstance(attn_metadata.prefill, FIPrefill)
                 prefill_wrapper = attn_metadata.prefill.wrapper
@@ -1517,6 +1517,7 @@ class FlashInferImpl(AttentionImpl):
                     )
                     assert prefill_wrapper._sm_scale == self.scale
                     assert prefill_wrapper._causal
+                    
                     prefill_wrapper.run(
                         prefill_query,
                         kv_cache_permute,
@@ -1525,6 +1526,7 @@ class FlashInferImpl(AttentionImpl):
                         v_scale=layer._v_scale_float,
                         out=output[num_decode_tokens:],
                     )
+                    
             else:
                 assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
                 # prefill_query may be non-contiguous or have degenerate strides
@@ -1532,17 +1534,19 @@ class FlashInferImpl(AttentionImpl):
                 # with reshape. contiguous() alone doesn't fix degenerate
                 # strides when a dimension has size 1.
                 prefill_query = prefill_query.contiguous().reshape(prefill_query.shape)
-                workspace_buffer = _get_trtllm_gen_workspace_buffer()
                 block_tables_prefill = attn_metadata.prefill.block_tables
+                workspace_buffer = _get_trtllm_gen_workspace_buffer()
                 seq_lens_prefill = attn_metadata.prefill.seq_lens
-
+                
                 # This path needs to be enabled with VLLM_KV_CACHE_LAYOUT = HND
-                assert get_kv_cache_layout() == "HND"
+                if current_platform.is_device_capability_family(100):
+                    assert get_kv_cache_layout() == "HND"
                 assert is_strictly_contiguous(prefill_query)
                 assert is_strictly_contiguous(workspace_buffer)
                 assert is_strictly_contiguous(block_tables_prefill)
                 assert is_strictly_contiguous(seq_lens_prefill)
-
+                assert kv_cache_permute.is_contiguous()
+                
                 if output.dtype == FP4_DTYPE:
                     assert self.o_sf_scale is not None
                     out = FP4Tensor(
@@ -1588,24 +1592,57 @@ class FlashInferImpl(AttentionImpl):
                     mock_kv_cache = kv_cache_permute
                     mock_block_table = block_tables_prefill
 
-                trtllm_batch_context_with_kv_cache(
-                    query=prefill_query,
-                    kv_cache=mock_kv_cache,
-                    workspace_buffer=workspace_buffer,
-                    block_tables=mock_block_table,
-                    seq_lens=seq_lens_prefill,
-                    max_q_len=attn_metadata.prefill.max_q_len,
-                    max_kv_len=attn_metadata.prefill.max_seq_len,
-                    bmm1_scale=self.bmm1_scale,
-                    bmm2_scale=self.bmm2_scale,
-                    batch_size=attn_metadata.num_prefills,
-                    cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
-                    cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
-                    window_left=self.window_left,
-                    sinks=self.sinks,
-                    o_sf_scale=self.o_sf_scale,
-                    out=out,
-                )
+                if current_platform.is_device_capability_family(100):
+                    trtllm_batch_context_with_kv_cache(
+                        query=prefill_query,
+                        kv_cache=mock_kv_cache,
+                        workspace_buffer=workspace_buffer,
+                        block_tables=mock_block_table,
+                        seq_lens=seq_lens_prefill,
+                        max_q_len=attn_metadata.prefill.max_q_len,
+                        max_kv_len=attn_metadata.prefill.max_seq_len,
+                        bmm1_scale=self.bmm1_scale,
+                        bmm2_scale=self.bmm2_scale,
+                        batch_size=attn_metadata.num_prefills,
+                        cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
+                        cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_kv,
+                        window_left=self.window_left,
+                        sinks=self.sinks,
+                        o_sf_scale=self.o_sf_scale,
+                        out=out,
+                    )
+                elif current_platform.is_device_capability_family(90) or current_platform.is_device_capability_family(120):
+                    prefill_key = key[num_decode_tokens:]
+                    prefill_val = value[num_decode_tokens:]
+                    prefill_key = prefill_key.contiguous().reshape(prefill_key.shape)
+                    prefill_val = prefill_val.contiguous().reshape(prefill_val.shape)
+                    assert is_strictly_contiguous(prefill_key)
+                    assert is_strictly_contiguous(prefill_val)
+                    qkv_arg = (prefill_query, prefill_key, prefill_val) #input_layout="SEPARATE_Q_K_V"
+                    input_layout="SEPARATE_Q_K_V"
+                    
+                    #qkv_arg=(prefill_query, mock_kv_cache) #input_layout="Q_PAGED_KV_NHD"
+                    #input_layout="Q_PAGED_KV_NHD"
+                    trtllm_fmha_v2_prefill(
+                        qkv_arg,
+                        input_layout=input_layout,
+                        workspace_buffer=workspace_buffer,
+                        block_tables=mock_block_table,
+                        seq_lens=seq_lens_prefill,
+                        max_q_len=attn_metadata.prefill.max_q_len,
+                        max_kv_len=attn_metadata.prefill.max_seq_len,
+                        bmm1_scale=self.bmm1_scale,
+                        bmm2_scale=self.bmm2_scale,
+                        batch_size=attn_metadata.num_prefills,
+                        cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
+                        cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_q,
+                        out=out,
+                        window_left=self.window_left,
+                        sinks=self.sinks,
+                    )
+                else:
+                    raise NotImplementedError(f"TRT-LLM prefill implementations are not available other than 90/100/120 platforms.")
+                        
 
         if num_decode_tokens > 0:
             decode_query = query[:num_decode_tokens]

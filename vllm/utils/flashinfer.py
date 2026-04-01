@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Compatibility wrapper for FlashInfer API changes.
-
 Users of vLLM should always import **only** these wrappers.
 """
 
@@ -339,12 +338,14 @@ def check_trtllm_attention_support(
     if not has_nvidia_artifactory():
         return False, "NVIDIA artifactory is not accessible."
 
-    if current_platform.is_device_capability(90):
-        if is_prefill:
-            return False, "SM90 is not supported for prefill."
+    if current_platform.is_device_capability(90) or current_platform.is_device_capability(120):
+        if is_prefill and not envs.VLLM_USE_TRTLLM_FMHA_V2:
+            return False, "trtllm fmha_v2 is disabled for prefill for SM90 and SM120."
         if q_data_type in [torch.float8_e4m3fn, torch.float8_e5m2]:
             return False, "xqa does not support FP8-Q."
     elif current_platform.is_device_capability_family(100):
+        if isinstance(kv_cache_dtype, torch.dtype):
+            kv_cache_dtype = str(kv_cache_dtype).split(".")[-1] 
         if (
             is_prefill
             and kv_cache_dtype is not None
@@ -353,8 +354,8 @@ def check_trtllm_attention_support(
         ):
             return False, "trtllm-gen prefill does not support FP8-Q with BF16/FP16-Q."
     else:
-        return False, "SMs other than 90/100/103 are not supported."
-
+        return False, "SMs other than 90/100/103/120 are not supported."
+    
     if dcp_world_size is not None and dcp_world_size > 1:
         return False, "DCP is not supported due to lack of LSE return support."
 
@@ -442,6 +443,7 @@ def use_trtllm_attention(
     phase_str = "prefill" if is_prefill else "decode"
     prefix = "[FlashInfer Attention]"
 
+    print(f"{supports_trtllm=} {reason=} {phase_str=}")
     # Helper functions to print warning/info if not silent.
     def print_warning(msg: str):
         if not silent:
