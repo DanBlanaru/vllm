@@ -29,9 +29,6 @@ from vllm.config import (
 from vllm.config.cache import CacheDType
 from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import (
-    vllm_is_batch_invariant,
-)
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8StaticTensorSym,
@@ -524,7 +521,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         ) = None  # Wrapper for prefill/append
         self._decode_wrapper = None  # Wrapper for decode (general shape)
 
-        if vllm_is_batch_invariant():
+        if envs.VLLM_BATCH_INVARIANT:
             self.decode_fixed_split_size = 2048
             self.prefill_fixed_split_size = 4096
             self.disable_split_kv = True
@@ -690,14 +687,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if vllm_config.attention_config.disable_flashinfer_q_quantization:
             return vllm_config.model_config.dtype
 
-        # On SM90, if kv-cache is FP8, use FP8-Q for prefill and BF16/FP16-Q for decode,
-        # except when TRTLLM is disabled.
+        # On SM90, if kv-cache is FP8, use BF16/FP16-Q for decode (XQA)
+        # and for prefill when FMHA v2 is enabled, since neither XQA nor
+        # FMHA v2 supports FP8 queries.
         cache_dtype = vllm_config.cache_config.cache_dtype
         if (
             current_platform.is_device_capability(90)
-            and not is_prefill
             and force_use_trtllm_attention() is not False
             and cache_dtype.startswith("fp8")
+            and (not is_prefill or envs.VLLM_USE_TRTLLM_FMHA_V2)
         ):
             return vllm_config.model_config.dtype
 
@@ -761,7 +759,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     def _get_workspace_buffer(self):
         if self._workspace_buffer is None:
             buffer_size = envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE
-            if vllm_is_batch_invariant():
+            if envs.VLLM_BATCH_INVARIANT:
                 buffer_size = FLASHINFER_WORKSPACE_BUFFER_SIZE_BATCH_INVARIANT
             self._workspace_buffer = torch.zeros(
                 buffer_size, dtype=torch.uint8, device=self.device
@@ -1612,19 +1610,20 @@ class FlashInferImpl(AttentionImpl):
                         out=out,
                     )
                 elif current_platform.is_device_capability_family(90) or current_platform.is_device_capability_family(120):
-                    prefill_key = key[num_decode_tokens:]
-                    prefill_val = value[num_decode_tokens:]
-                    prefill_key = prefill_key.contiguous().reshape(prefill_key.shape)
-                    prefill_val = prefill_val.contiguous().reshape(prefill_val.shape)
-                    assert is_strictly_contiguous(prefill_key)
-                    assert is_strictly_contiguous(prefill_val)
-                    qkv_arg = (prefill_query, prefill_key, prefill_val) #input_layout="SEPARATE_Q_K_V"
-                    input_layout="SEPARATE_Q_K_V"
-                    
-                    #qkv_arg=(prefill_query, mock_kv_cache) #input_layout="Q_PAGED_KV_NHD"
-                    #input_layout="Q_PAGED_KV_NHD"
+                    kv_layout = get_kv_cache_layout()
+                    input_layout = f"Q_PAGED_KV_{kv_layout}"
+                    cum_seq_lens_kv_tokens = torch.cat([
+                        torch.zeros(
+                            1,
+                            dtype=torch.int32,
+                            device=seq_lens_prefill.device,
+                        ),
+                        torch.cumsum(
+                            seq_lens_prefill, dim=0, dtype=torch.int32
+                        ),
+                    ])
                     trtllm_fmha_v2_prefill(
-                        qkv_arg,
+                        (prefill_query, mock_kv_cache),
                         input_layout=input_layout,
                         workspace_buffer=workspace_buffer,
                         block_tables=mock_block_table,
@@ -1635,7 +1634,7 @@ class FlashInferImpl(AttentionImpl):
                         bmm2_scale=self.bmm2_scale,
                         batch_size=attn_metadata.num_prefills,
                         cum_seq_lens_q=attn_metadata.prefill.cum_seq_lens_q,
-                        cum_seq_lens_kv=attn_metadata.prefill.cum_seq_lens_q,
+                        cum_seq_lens_kv=cum_seq_lens_kv_tokens,
                         out=out,
                         window_left=self.window_left,
                         sinks=self.sinks,

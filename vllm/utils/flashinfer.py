@@ -18,9 +18,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
-from vllm.model_executor.layers.batch_invariant import (
-    vllm_is_batch_invariant,
-)
+import vllm.envs as envs
 from vllm.platforms import current_platform
 
 logger = init_logger(__name__)
@@ -332,7 +330,7 @@ def check_trtllm_attention_support(
         used.
     """
 
-    if vllm_is_batch_invariant():
+    if envs.VLLM_BATCH_INVARIANT:
         return False, "Batch-invariant mode is enabled."
 
     if not has_nvidia_artifactory():
@@ -341,8 +339,8 @@ def check_trtllm_attention_support(
     if current_platform.is_device_capability(90) or current_platform.is_device_capability(120):
         if is_prefill and not envs.VLLM_USE_TRTLLM_FMHA_V2:
             return False, "trtllm fmha_v2 is disabled for prefill for SM90 and SM120."
-        if q_data_type in [torch.float8_e4m3fn, torch.float8_e5m2]:
-            return False, "xqa does not support FP8-Q."
+        # if q_data_type in [torch.float8_e4m3fn, torch.float8_e5m2]:
+        #     return False, "xqa does not support FP8-Q."
     elif current_platform.is_device_capability_family(100):
         if isinstance(kv_cache_dtype, torch.dtype):
             kv_cache_dtype = str(kv_cache_dtype).split(".")[-1] 
