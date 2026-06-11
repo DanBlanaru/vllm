@@ -745,7 +745,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             return vllm_config.model_config.dtype
 
         # On SM90, XQA decode requires BF16/FP16-Q even with FP8 KV cache.
-        # FI native prefill on SM90 still uses FP8-Q in that case.
+        # Prefill can still prefer FP8-Q; layer-specific native FlashInfer
+        # limitations such as sliding-window prefill are handled when metadata
+        # is built and the layer's window_left is known.
         cache_dtype = vllm_config.cache_config.cache_dtype
         if (
             current_platform.is_device_capability(90)
@@ -1009,6 +1011,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         all_uses_trtllm = (num_prefills == 0 or prefill_use_trtllm) and (
             num_decodes == 0 or decode_with_flashinfer_trtllm_api
         )
+        q_data_type_prefill = self.q_data_type_prefill
+        q_data_type_decode = self.q_data_type_decode
+        if use_cascade:
+            q_data_type_prefill = self.model_config.dtype
+            q_data_type_decode = self.model_config.dtype
+        else:
+            if num_prefills > 0 and not prefill_use_trtllm and self.window_left != -1:
+                # Native FlashInfer FP8-Q prefill hangs on SM90 sliding-window
+                # layers. Keep full-attention prefill on the faster FP8-Q path.
+                q_data_type_prefill = self.model_config.dtype
+            if num_decodes > 0 and not decode_with_flashinfer_trtllm_api:
+                q_data_type_decode = self.model_config.dtype
 
         if not all_uses_trtllm:
             if self.has_sinks:
@@ -1037,8 +1051,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         attn_metadata = FlashInferMetadata(
             num_actual_tokens=num_actual_tokens,
             slot_mapping=common_attn_metadata.slot_mapping,
-            q_data_type_prefill=self.q_data_type_prefill,
-            q_data_type_decode=self.q_data_type_decode,
+            q_data_type_prefill=q_data_type_prefill,
+            q_data_type_decode=q_data_type_decode,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
@@ -1228,7 +1242,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         sm_scale=self.sm_scale,
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
-                        q_data_type=self.q_data_type_prefill,
+                        q_data_type=q_data_type_prefill,
                         kv_cache_dtype=self.kv_cache_dtype,
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
@@ -1257,7 +1271,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         sm_scale=self.sm_scale,
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
-                        q_data_type=self.q_data_type_prefill,
+                        q_data_type=q_data_type_prefill,
                         kv_data_type=self.kv_cache_dtype,
                         o_data_type=o_dtype,
                         fixed_split_size=self.prefill_fixed_split_size,
@@ -1317,7 +1331,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     sm_scale=self.sm_scale,
                     window_left=self.window_left,
                     logits_soft_cap=self.logits_soft_cap,
-                    q_data_type=self.q_data_type_decode,
+                    q_data_type=q_data_type_decode,
                     kv_data_type=self.kv_cache_dtype,
                     o_data_type=o_dtype,
                     fixed_split_size=self.decode_fixed_split_size,
