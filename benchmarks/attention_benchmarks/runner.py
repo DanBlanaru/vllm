@@ -426,8 +426,11 @@ def _create_kv_cache(
 
     cache_list = []
     for _ in range(config.num_layers):
-        # Allocate in physical layout order (contiguous in memory)
-        cache = torch.zeros(*physical_shape, device=device, dtype=cache_dtype)
+        # Allocate and initialize in physical layout order so long-context
+        # correctness checks do not all attend over an all-zero KV cache.
+        cache = torch.randn(*physical_shape, device=device, dtype=dtype).to(
+            cache_dtype
+        )
         # Permute to logical view
         cache = cache.permute(*inv_order)
         cache_list.append(cache)

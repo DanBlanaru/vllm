@@ -8,7 +8,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
-OUT_DIR="${BENCH_ROOT}/artifacts/sm120_fi_noncausal_one_by_one"
+OUT_DIR="${OUT_DIR:-${BENCH_ROOT}/artifacts/sm120_fi_noncausal_one_by_one}"
 
 mkdir -p "${OUT_DIR}/json" "${OUT_DIR}/csv" "${OUT_DIR}/logs"
 
