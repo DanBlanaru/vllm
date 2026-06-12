@@ -12,9 +12,13 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
+EXPERIMENT_DIR="${EXPERIMENT_DIR:-${BENCH_ROOT}/artifacts/sm120_specdec_kernel_microbench}"
+OUT_DIR="${EXPERIMENT_DIR}/raw/repros"
+
+mkdir -p "${OUT_DIR}"
 
 cd "${BENCH_ROOT}"
 
 make container-launch-vllm-detach \
   VLLM_DIR=vllm-sm120-specdec-kernel-bench \
-  RUN_CMD="bash -lc 'cd ${BENCH_ROOT}/vllm-sm120-specdec-kernel-bench/benchmarks/attention_benchmarks && CUDA_LAUNCH_BLOCKING=1 python benchmark.py --config configs/sm120_specdec_kernel_microbench_nocg.yaml --attention-kernels fi_prefill_noncausal --batch-specs 16q8s64k --repeats 1 --warmup-iters 1 --output-json ${BENCH_ROOT}/artifacts/sm120_specdec_kernel_microbench_fi_16q8s64k_repro.json --output-csv ${BENCH_ROOT}/artifacts/sm120_specdec_kernel_microbench_fi_16q8s64k_repro.csv'"
+  RUN_CMD="bash -lc 'cd ${BENCH_ROOT}/vllm-sm120-specdec-kernel-bench/benchmarks/attention_benchmarks && CUDA_LAUNCH_BLOCKING=1 python benchmark.py --config configs/sm120_specdec_kernel_microbench_nocg.yaml --attention-kernels fi_prefill_noncausal --batch-specs 16q8s64k --repeats 1 --warmup-iters 1 --output-json ${OUT_DIR}/fi_16q8s64k_repro.json --output-csv ${OUT_DIR}/fi_16q8s64k_repro.csv'"

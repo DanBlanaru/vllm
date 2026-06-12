@@ -12,16 +12,12 @@ from pathlib import Path
 
 
 BENCH_ROOT = Path("/home/scratch/scratch.dblanaru/bench_serving")
-TRITON_XQA_JSON = (
-    BENCH_ROOT
-    / "artifacts/sm120_specdec_kernel_microbench_grid_triton_xqa_nocg.json"
+DEFAULT_EXPERIMENT_DIR = BENCH_ROOT / "artifacts/sm120_specdec_kernel_microbench"
+TRITON_XQA_FILENAMES = (
+    "triton_xqa_nocg.json",
+    "triton_xqa_16q8s64k.json",
+    "triton_xqa_64q8s64k.json",
 )
-FI_DIR = BENCH_ROOT / "artifacts/sm120_fi_noncausal_one_by_one"
-FI_SUMMARY = FI_DIR / "summary.csv"
-OUT_MD = BENCH_ROOT / "artifacts/sm120_specdec_kernel_microbench_grid_final.md"
-OUT_CSV = BENCH_ROOT / "artifacts/sm120_specdec_kernel_microbench_grid_final.csv"
-OUT_FI_MD = BENCH_ROOT / "artifacts/sm120_specdec_kernel_microbench_grid_fi_indexed.md"
-OUT_FI_CSV = BENCH_ROOT / "artifacts/sm120_specdec_kernel_microbench_grid_fi_indexed.csv"
 
 
 def parse_args() -> Namespace:
@@ -30,6 +26,15 @@ def parse_args() -> Namespace:
             "Summarize SM120 q8 Triton/XQA grid results and FI one-by-one "
             "results. Defaults reproduce the original handoff tables."
         )
+    )
+    parser.add_argument(
+        "--experiment-dir",
+        type=Path,
+        default=DEFAULT_EXPERIMENT_DIR,
+        help=(
+            "Experiment artifact folder. The postprocessor reads raw/ inputs "
+            "and writes fi_indexed.* / triton_indexed.* here."
+        ),
     )
     parser.add_argument(
         "--triton-xqa-json",
@@ -44,34 +49,54 @@ def parse_args() -> Namespace:
     parser.add_argument(
         "--fi-summary",
         type=Path,
-        default=FI_SUMMARY,
+        default=None,
         help="FI one-by-one summary.csv with per-shape JSON paths.",
     )
     parser.add_argument(
         "--out-md",
         type=Path,
-        default=OUT_MD,
+        default=None,
         help="Output Markdown path for the Triton-indexed table.",
     )
     parser.add_argument(
         "--out-csv",
         type=Path,
-        default=OUT_CSV,
+        default=None,
         help="Output CSV path for the Triton-indexed table.",
     )
     parser.add_argument(
         "--out-fi-md",
         type=Path,
-        default=OUT_FI_MD,
+        default=None,
         help="Output Markdown path for the FI-indexed table.",
     )
     parser.add_argument(
         "--out-fi-csv",
         type=Path,
-        default=OUT_FI_CSV,
+        default=None,
         help="Output CSV path for the FI-indexed table.",
     )
     return parser.parse_args()
+
+
+def resolve_paths(args: Namespace) -> Namespace:
+    experiment_dir = args.experiment_dir
+    raw_dir = experiment_dir / "raw"
+    if args.triton_xqa_jsons is None:
+        args.triton_xqa_jsons = [
+            raw_dir / name for name in TRITON_XQA_FILENAMES if (raw_dir / name).exists()
+        ]
+    if args.fi_summary is None:
+        args.fi_summary = raw_dir / "fi_noncausal_one_by_one/summary.csv"
+    if args.out_md is None:
+        args.out_md = experiment_dir / "triton_indexed.md"
+    if args.out_csv is None:
+        args.out_csv = experiment_dir / "triton_indexed.csv"
+    if args.out_fi_md is None:
+        args.out_fi_md = experiment_dir / "fi_indexed.md"
+    if args.out_fi_csv is None:
+        args.out_fi_csv = experiment_dir / "fi_indexed.csv"
+    return args
 
 
 def load_results(paths: list[Path]) -> dict[tuple[str, str], dict]:
@@ -148,9 +173,13 @@ def fmt_speed(row: dict | None, triton: dict | None) -> str:
 
 
 def fmt_diff(row: dict | None) -> str:
+    return fmt_diff_metric(row, "output_max_abs_diff_vs_triton")
+
+
+def fmt_diff_metric(row: dict | None, metric: str) -> str:
     if row is None:
         return "ERR"
-    val = row.get("output_max_abs_diff_vs_triton")
+    val = row.get(metric)
     if val is None:
         return "n/a"
     return f"{val:.3e}"
@@ -192,8 +221,12 @@ def spec_sort_key(spec: str) -> tuple[int, int, int]:
 
 
 def main() -> None:
-    args = parse_args()
-    triton_xqa_jsons = args.triton_xqa_jsons or [TRITON_XQA_JSON]
+    args = resolve_paths(parse_args())
+    triton_xqa_jsons = args.triton_xqa_jsons
+    if not triton_xqa_jsons:
+        raise FileNotFoundError(
+            f"No Triton/XQA JSON files found under {args.experiment_dir / 'raw'}"
+        )
 
     tx = load_results(triton_xqa_jsons)
     fi_status, fi_rows_by_spec = load_fi_data(args.fi_summary)
@@ -245,8 +278,24 @@ def main() -> None:
                 "fi_time": fmt_time(fi) if fi is not None else "ERR",
                 "xqa_vs_fi": fmt_backend_vs_fi(xqa, fi),
                 "triton_vs_fi": fmt_backend_vs_fi(triton, fi),
-                "fi_max_abs_diff": fmt_diff(fi) if fi is not None else "ERR",
-                "xqa_max_abs_diff": fmt_diff(xqa),
+                "fi_max_abs_diff_vs_triton": fmt_diff_metric(
+                    fi, "output_max_abs_diff_vs_triton"
+                ),
+                "fi_mean_abs_diff_vs_triton": fmt_diff_metric(
+                    fi, "output_mean_abs_diff_vs_triton"
+                ),
+                "fi_rms_diff_vs_triton": fmt_diff_metric(
+                    fi, "output_rms_diff_vs_triton"
+                ),
+                "xqa_max_abs_diff_vs_triton": fmt_diff_metric(
+                    xqa, "output_max_abs_diff_vs_triton"
+                ),
+                "xqa_mean_abs_diff_vs_triton": fmt_diff_metric(
+                    xqa, "output_mean_abs_diff_vs_triton"
+                ),
+                "xqa_rms_diff_vs_triton": fmt_diff_metric(
+                    xqa, "output_rms_diff_vs_triton"
+                ),
                 "fi_status": fi_status_str,
             }
         )
