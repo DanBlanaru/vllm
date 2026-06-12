@@ -1,0 +1,89 @@
+# SM120 8-token speculative decode / dflash kernel microbenchmark.
+#
+# Run from benchmarks/attention_benchmarks on an SM120/SM121 machine:
+#   python benchmark.py --config configs/sm120_specdec_kernel_microbench.yaml
+#
+# The logical labels map to real vLLM backends in runner.py:
+#   triton               -> TRITON_ATTN
+#   fi_prefill_noncausal -> FLASHINFER native prefill, causal=False
+#   xqa_decode_causal    -> FLASHINFER TRTLLM decode API, backend="xqa"
+
+description: "SM120 q8 specdec kernel comparison"
+
+attention_kernels:
+  - triton
+  - fi_prefill_noncausal
+  - xqa_decode_causal
+
+model:
+  num_layers: 10
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  block_size: 16
+
+batch_specs:
+  # Full grid: q_len=8, ISL powers of two from 1k to 64k,
+  # context/request counts powers of two from 1 to 64.
+  - "q8s1k"
+  - "q8s2k"
+  - "q8s4k"
+  - "q8s8k"
+  - "q8s16k"
+  - "q8s32k"
+  - "q8s64k"
+  - "2q8s1k"
+  - "2q8s2k"
+  - "2q8s4k"
+  - "2q8s8k"
+  - "2q8s16k"
+  - "2q8s32k"
+  - "2q8s64k"
+  - "4q8s1k"
+  - "4q8s2k"
+  - "4q8s4k"
+  - "4q8s8k"
+  - "4q8s16k"
+  - "4q8s32k"
+  - "4q8s64k"
+  - "8q8s1k"
+  - "8q8s2k"
+  - "8q8s4k"
+  - "8q8s8k"
+  - "8q8s16k"
+  - "8q8s32k"
+  - "8q8s64k"
+  - "16q8s1k"
+  - "16q8s2k"
+  - "16q8s4k"
+  - "16q8s8k"
+  - "16q8s16k"
+  - "16q8s32k"
+  # FI native non-causal prefill crashes here with CUDA illegal memory access.
+  # Reproducer: ../repro_fi_noncausal_16q8s64k.sh
+  # - "16q8s64k"
+  - "32q8s1k"
+  - "32q8s2k"
+  - "32q8s4k"
+  - "32q8s8k"
+  - "32q8s16k"
+  - "32q8s32k"
+  - "32q8s64k"
+  - "64q8s1k"
+  - "64q8s2k"
+  - "64q8s4k"
+  - "64q8s8k"
+  - "64q8s16k"
+  - "64q8s32k"
+  - "64q8s64k"
+
+kv_cache_dtype: fp8
+device: "cuda:0"
+repeats: 10
+warmup_iters: 5
+cuda_graphs: true
+profile_memory: false
+
+output:
+  csv: "sm120_specdec_kernel_microbench.csv"
+  json: "sm120_specdec_kernel_microbench.json"

@@ -9,8 +9,10 @@ This module provides helpers for running standard attention backends
 """
 
 import logging
+import os
 import types
 from contextlib import contextmanager
+from dataclasses import replace
 
 import numpy as np
 import torch
@@ -33,11 +35,20 @@ from vllm.v1.attention.backends.utils import (
     get_kv_cache_layout,
     set_kv_cache_layout,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, get_kv_quant_mode
 
 # ============================================================================
 # Backend Configuration
 # ============================================================================
+
+ATTENTION_KERNEL_BACKENDS = {
+    "triton": "TRITON_ATTN",
+    "fi_prefill_noncausal": "FLASHINFER",
+    "fi_prefill_causal": "FLASHINFER",
+    "xqa_decode_causal": "FLASHINFER",
+}
+_TRITON_OUTPUT_BASELINES: dict[tuple, torch.Tensor] = {}
+_TRITON_TIME_BASELINES: dict[tuple, float] = {}
 
 
 def _get_backend_config(backend: str) -> dict:
@@ -65,6 +76,12 @@ def _get_backend_config(backend: str) -> dict:
     return {"backend_class": backend_class}
 
 
+def _resolve_attention_backend(config: BenchmarkConfig) -> tuple[str, str]:
+    """Return (display_label, registry_backend)."""
+    label = config.attention_kernel or config.backend
+    return label, ATTENTION_KERNEL_BACKENDS.get(label, config.backend)
+
+
 @contextmanager
 def log_warnings_and_errors_only():
     """Temporarily set vLLM logger to WARNING level."""
@@ -75,6 +92,36 @@ def log_warnings_and_errors_only():
         yield
     finally:
         logger.setLevel(old_level)
+
+
+@contextmanager
+def benchmark_flashinfer_env(config: BenchmarkConfig):
+    """Set benchmark-only env switches for FlashInfer hacks."""
+    old_causal = os.environ.get("VLLM_BENCHMARK_FLASHINFER_PREFILL_CAUSAL")
+    old_prefill_dtype = os.environ.get(
+        "VLLM_BENCHMARK_FLASHINFER_PREFILL_MODEL_DTYPE"
+    )
+    try:
+        if config.attention_kernel == "fi_prefill_noncausal":
+            os.environ["VLLM_BENCHMARK_FLASHINFER_PREFILL_CAUSAL"] = "0"
+            os.environ["VLLM_BENCHMARK_FLASHINFER_PREFILL_MODEL_DTYPE"] = "1"
+        elif config.attention_kernel == "fi_prefill_causal":
+            os.environ["VLLM_BENCHMARK_FLASHINFER_PREFILL_CAUSAL"] = "1"
+            os.environ["VLLM_BENCHMARK_FLASHINFER_PREFILL_MODEL_DTYPE"] = "1"
+        yield
+    finally:
+        if old_causal is None:
+            os.environ.pop("VLLM_BENCHMARK_FLASHINFER_PREFILL_CAUSAL", None)
+        else:
+            os.environ["VLLM_BENCHMARK_FLASHINFER_PREFILL_CAUSAL"] = old_causal
+        if old_prefill_dtype is None:
+            os.environ.pop(
+                "VLLM_BENCHMARK_FLASHINFER_PREFILL_MODEL_DTYPE", None
+            )
+        else:
+            os.environ[
+                "VLLM_BENCHMARK_FLASHINFER_PREFILL_MODEL_DTYPE"
+            ] = old_prefill_dtype
 
 
 # ============================================================================
@@ -130,8 +177,8 @@ def _create_vllm_config(
 ) -> VllmConfig:
     """Create a VllmConfig for benchmarking with mock model methods."""
     model_config = ModelConfig(
-        model="meta-llama/Meta-Llama-3-8B",
-        tokenizer="meta-llama/Meta-Llama-3-8B",
+        model="Qwen/Qwen2.5-0.5B",
+        tokenizer="Qwen/Qwen2.5-0.5B",
         trust_remote_code=False,
         dtype="auto",  # Use model's native dtype
         seed=0,
@@ -181,7 +228,7 @@ def _create_vllm_config(
     )
     model_config.get_sliding_window = types.MethodType(lambda self: None, model_config)
 
-    return VllmConfig(
+    vllm_config = VllmConfig(
         model_config=model_config,
         cache_config=cache_config,
         parallel_config=parallel_config,
@@ -190,11 +237,32 @@ def _create_vllm_config(
         load_config=load_config,
         compilation_config=compilation_config,
     )
+    if config.attention_kernel == "xqa_decode_causal":
+        vllm_config.attention_config.use_trtllm_attention = True
+    return vllm_config
 
 
 # ============================================================================
 # Backend Initialization
 # ============================================================================
+
+
+def _create_kv_cache_spec(
+    config: BenchmarkConfig,
+    dtype: torch.dtype,
+) -> FullAttentionSpec:
+    spec_dtype = dtype
+    if config.kv_cache_dtype.startswith("fp8"):
+        from vllm.platforms import current_platform
+
+        spec_dtype = current_platform.fp8_dtype()
+    return FullAttentionSpec(
+        block_size=config.block_size,
+        num_kv_heads=config.num_kv_heads,
+        head_size=config.head_dim,
+        dtype=spec_dtype,
+        kv_quant_mode=get_kv_quant_mode(config.kv_cache_dtype),
+    )
 
 
 def _create_backend_impl(
@@ -218,12 +286,7 @@ def _create_backend_impl(
         kv_cache_dtype=config.kv_cache_dtype,
     )
 
-    kv_cache_spec = FullAttentionSpec(
-        block_size=config.block_size,
-        num_kv_heads=config.num_kv_heads,
-        head_size=config.head_dim,
-        dtype=dtype,
-    )
+    kv_cache_spec = _create_kv_cache_spec(config, dtype)
 
     layer = MockLayer(device, kv_cache_spec=kv_cache_spec)
 
@@ -372,6 +435,58 @@ def _create_kv_cache(
     return cache_list
 
 
+def _baseline_key(config: BenchmarkConfig) -> tuple:
+    return (
+        config.batch_spec,
+        config.num_layers,
+        config.head_dim,
+        config.num_q_heads,
+        config.num_kv_heads,
+        config.block_size,
+        config.kv_cache_dtype,
+    )
+
+
+def _is_triton_baseline(config: BenchmarkConfig) -> bool:
+    return config.attention_kernel == "triton" or config.resolved_backend == "TRITON_ATTN"
+
+
+def _describe_internal_path(config: BenchmarkConfig, attn_metadata) -> BenchmarkConfig:
+    """Attach path diagnostics to the result config."""
+    if config.resolved_backend != "FLASHINFER":
+        return replace(
+            config,
+            resolved_internal_path=config.resolved_backend,
+        )
+
+    prefill = getattr(attn_metadata, "prefill", None)
+    decode = getattr(attn_metadata, "decode", None)
+    prefill_name = type(prefill).__name__ if prefill is not None else "none"
+    decode_name = type(decode).__name__ if decode is not None else "none"
+
+    prefill_causal = None
+    wrapper = getattr(prefill, "wrapper", None)
+    if wrapper is not None and hasattr(wrapper, "_causal"):
+        prefill_causal = bool(wrapper._causal)
+
+    decode_backend = None
+    decode_kernel = getattr(decode, "kernel", None)
+    if decode_kernel is not None:
+        decode_backend = decode_kernel.value
+
+    parts = [f"prefill={prefill_name}", f"decode={decode_name}"]
+    if prefill_causal is not None:
+        parts.append(f"prefill_causal={prefill_causal}")
+    if decode_backend is not None:
+        parts.append(f"decode_backend={decode_backend}")
+    return replace(
+        config,
+        resolved_internal_path=";".join(parts),
+        flashinfer_prefill_causal=prefill_causal,
+        flashinfer_decode_backend=decode_backend,
+    )
+
+
 # ============================================================================
 # Benchmark Execution
 # ============================================================================
@@ -461,7 +576,7 @@ def _run_single_benchmark(
             "reserved_mb": torch.accelerator.memory_reserved(device) / 1024**2,
         }
 
-    return times, mem_stats
+    return times, mem_stats, out.detach().float().cpu()
 
 
 # ============================================================================
@@ -484,11 +599,18 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     device = torch.device(config.device)
     torch.accelerator.set_device_index(device)
 
-    backend_cfg = _get_backend_config(config.backend)
+    label, resolved_backend = _resolve_attention_backend(config)
+    config = replace(
+        config,
+        backend=label,
+        attention_kernel=config.attention_kernel or label,
+        resolved_backend=resolved_backend,
+    )
+    backend_cfg = _get_backend_config(resolved_backend)
 
     requests = parse_batch_spec(config.batch_spec)
 
-    if config.backend == "FLASHINFER":
+    if resolved_backend == "FLASHINFER":
         requests = reorder_for_flashinfer(requests)
 
     q_lens = [r.q_len for r in requests]
@@ -502,7 +624,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     max_num_blocks = batch_size * max_blocks_per_request
 
     # Suppress vLLM logs during setup to reduce spam
-    with log_warnings_and_errors_only():
+    with log_warnings_and_errors_only(), benchmark_flashinfer_env(config):
         # Create vllm_config first - uses model's native dtype via "auto"
         vllm_config = _create_vllm_config(config, max_num_blocks)
         dtype = vllm_config.model_config.dtype
@@ -525,26 +647,27 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 q_lens, kv_lens, config.block_size, device
             )
 
-            kv_cache_spec = FullAttentionSpec(
-                block_size=config.block_size,
-                num_kv_heads=config.num_kv_heads,
-                head_size=config.head_dim,
-                dtype=dtype,
-            )
+            kv_cache_spec = _create_kv_cache_spec(config, dtype)
 
             builder = _create_metadata_builder(
-                backend_class, kv_cache_spec, vllm_config, device, config.backend
+                backend_class, kv_cache_spec, vllm_config, device, resolved_backend
             )
+            if config.attention_kernel == "xqa_decode_causal":
+                builder.reorder_batch_threshold = max(q_lens)
 
             attn_metadata = builder.build(
                 common_prefix_len=0,
                 common_attn_metadata=common_metadata,
             )
+            config = _describe_internal_path(config, attn_metadata)
 
             # Only quantize queries when the impl supports it
             quantize_query = config.kv_cache_dtype.startswith("fp8") and getattr(
                 impl, "supports_quant_query_input", False
             )
+            torch.manual_seed(0)
+            if device.type == "cuda":
+                torch.cuda.manual_seed_all(0)
             q_list, k_list, v_list = _create_input_tensors(
                 config, total_q, device, dtype, quantize_query=quantize_query
             )
@@ -553,7 +676,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
                 config, max_num_blocks, backend_class, device, dtype
             )
 
-            times, mem_stats = _run_single_benchmark(
+            times, mem_stats, output_cpu = _run_single_benchmark(
                 config,
                 impl,
                 layer,
@@ -568,6 +691,27 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
 
     mean_time = np.mean(times)
     throughput = total_q / mean_time if mean_time > 0 else 0
+    key = _baseline_key(config)
+    speed_vs_triton = None
+    output_max_abs_diff_vs_triton = None
+    output_mean_abs_diff_vs_triton = None
+    output_rms_diff_vs_triton = None
+    if _is_triton_baseline(config):
+        _TRITON_OUTPUT_BASELINES[key] = output_cpu
+        _TRITON_TIME_BASELINES[key] = mean_time
+        speed_vs_triton = 1.0
+        output_max_abs_diff_vs_triton = 0.0
+        output_mean_abs_diff_vs_triton = 0.0
+        output_rms_diff_vs_triton = 0.0
+    elif key in _TRITON_TIME_BASELINES:
+        speed_vs_triton = _TRITON_TIME_BASELINES[key] / mean_time
+        baseline = _TRITON_OUTPUT_BASELINES.get(key)
+        if baseline is not None and baseline.shape == output_cpu.shape:
+            diff = output_cpu - baseline
+            abs_diff = diff.abs()
+            output_max_abs_diff_vs_triton = abs_diff.max().item()
+            output_mean_abs_diff_vs_triton = abs_diff.mean().item()
+            output_rms_diff_vs_triton = torch.sqrt((diff * diff).mean()).item()
 
     return BenchmarkResult(
         config=config,
@@ -578,4 +722,8 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
         throughput_tokens_per_sec=throughput,
         memory_allocated_mb=mem_stats.get("allocated_mb"),
         memory_reserved_mb=mem_stats.get("reserved_mb"),
+        speed_vs_triton=speed_vs_triton,
+        output_max_abs_diff_vs_triton=output_max_abs_diff_vs_triton,
+        output_mean_abs_diff_vs_triton=output_mean_abs_diff_vs_triton,
+        output_rms_diff_vs_triton=output_rms_diff_vs_triton,
     )

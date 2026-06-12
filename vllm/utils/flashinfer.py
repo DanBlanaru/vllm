@@ -352,23 +352,26 @@ def supports_trtllm_attention(is_prefill: bool = False) -> bool:
     """Return whether TRTLLM attention is available on the current platform
     for the given attention phase.
 
-    SM90 (Hopper) supports the XQA decode kernel but not TRTLLM prefill.
-    SM100+ supports TRTLLM for both phases. All others are unsupported.
+    SM90/SM120/SM121 support the JIT XQA decode kernel but not TRTLLM
+    prefill. SM100/SM103 supports TRTLLM for both phases through cubins.
+    All others are unsupported.
     """
     # Batch-invariant mode disables TRTLLM attention
     if envs.VLLM_BATCH_INVARIANT:
         return False
 
-    # Requires NVIDIA artifactory to be accessible to download cubins
-    if not has_nvidia_artifactory():
-        return False
-
-    # SM90 has XQA decode; prefill is not supported.
-    if current_platform.is_device_capability(90):
+    # XQA is JIT-compiled and does not need the SM100 cubin/artifactory path.
+    if (
+        current_platform.is_device_capability(90)
+        or current_platform.is_device_capability(120)
+        or current_platform.is_device_capability(121)
+    ):
         return not is_prefill
 
-    # SM100/SM103 has both prefill and decode TRTLLM kernels.
-    return current_platform.is_device_capability_family(100)
+    # SM100/SM103 has both prefill and decode TRTLLM kernels, but needs cubins.
+    if current_platform.is_device_capability_family(100):
+        return has_nvidia_artifactory()
+    return False
 
 
 def force_use_trtllm_attention() -> bool | None:

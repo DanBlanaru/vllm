@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Attention layer with FlashInfer."""
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from functools import partial
@@ -88,6 +89,7 @@ FP4_DTYPE = torch.uint8
 logger = init_logger(__name__)
 
 trtllm_workspace_buffer = None
+_xqa_spec_decode_causal_mask_cache: dict[tuple[str, int, int], torch.Tensor] = {}
 
 
 def _get_trtllm_workspace_buffer():
@@ -97,6 +99,52 @@ def _get_trtllm_workspace_buffer():
             envs.VLLM_FLASHINFER_WORKSPACE_BUFFER_SIZE, dtype=torch.uint8, device="cuda"
         )
     return trtllm_workspace_buffer
+
+
+def _benchmark_flashinfer_prefill_causal() -> bool:
+    return os.environ.get("VLLM_BENCHMARK_FLASHINFER_PREFILL_CAUSAL") != "0"
+
+
+def _get_xqa_spec_decode_causal_mask(
+    batch_size: int,
+    q_seq_len: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Return FlashInfer XQA's bit-packed causal mask for uniform spec decode."""
+    key = (str(device), batch_size, q_seq_len)
+    mask = _xqa_spec_decode_causal_mask_cache.get(key)
+    if mask is not None:
+        return mask
+
+    num_packed_masks_per_token = (q_seq_len + 31) // 32
+    q_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(1)
+    kv_indices = torch.arange(q_seq_len, device=device, dtype=torch.int32).unsqueeze(0)
+    causal_bool_mask = kv_indices <= q_indices
+
+    padded_seq_len = num_packed_masks_per_token * 32
+    if padded_seq_len > q_seq_len:
+        padding = torch.zeros(
+            q_seq_len, padded_seq_len - q_seq_len, device=device, dtype=torch.bool
+        )
+        causal_bool_mask = torch.cat([causal_bool_mask, padding], dim=1)
+
+    causal_bool_mask = causal_bool_mask.view(
+        q_seq_len, num_packed_masks_per_token, 32
+    )
+    bit_positions = torch.tensor(
+        [1 << i for i in range(32)], device=device, dtype=torch.int64
+    )
+    mask_uint32 = (
+        (causal_bool_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
+    )
+    mask_uint32 = (
+        mask_uint32.unsqueeze(0)
+        .expand(batch_size, q_seq_len, num_packed_masks_per_token)
+        .contiguous()
+    )
+    mask = mask_uint32.view(torch.uint16)
+    _xqa_spec_decode_causal_mask_cache[key] = mask
+    return mask
 
 
 @triton.jit
@@ -744,13 +792,25 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         if vllm_config.attention_config.disable_flashinfer_q_quantization:
             return vllm_config.model_config.dtype
 
-        # On SM90, XQA decode requires BF16/FP16-Q even with FP8 KV cache.
+        if (
+            is_prefill
+            and os.environ.get("VLLM_BENCHMARK_FLASHINFER_PREFILL_MODEL_DTYPE")
+            == "1"
+        ):
+            return vllm_config.model_config.dtype
+
+        # On XQA decode, the non-MLA kernel requires BF16/FP16-Q even with
+        # FP8 KV cache.
         # Prefill can still prefer FP8-Q; layer-specific native FlashInfer
         # limitations such as sliding-window prefill are handled when metadata
         # is built and the layer's window_left is known.
         cache_dtype = vllm_config.cache_config.cache_dtype
         if (
-            current_platform.is_device_capability(90)
+            (
+                current_platform.is_device_capability(90)
+                or current_platform.is_device_capability(120)
+                or current_platform.is_device_capability(121)
+            )
             and not is_prefill
             and force_use_trtllm_attention() is not False
             and cache_dtype.startswith("fp8")
@@ -833,7 +893,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
     @staticmethod
     def _get_flashinfer_trtllm_api_decode_kernel() -> FlashInferDecodeKernel:
-        if current_platform.is_device_capability(90):
+        if (
+            current_platform.is_device_capability(90)
+            or current_platform.is_device_capability(120)
+            or current_platform.is_device_capability(121)
+        ):
             return FlashInferDecodeKernel.XQA
         assert current_platform.is_device_capability_family(100)
         return FlashInferDecodeKernel.TRTLLM_GEN
@@ -1267,7 +1331,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         num_kv_heads=self.num_kv_heads,
                         head_dim_qk=self.head_dim,
                         page_size=self.page_size,
-                        causal=True,
+                        causal=_benchmark_flashinfer_prefill_causal(),
                         sm_scale=self.sm_scale,
                         window_left=self.window_left,
                         logits_soft_cap=self.logits_soft_cap,
@@ -1704,7 +1768,10 @@ class FlashInferImpl(AttentionImpl):
                         self.logits_soft_cap or 0.0
                     )
                     assert prefill_wrapper._sm_scale == self.scale
-                    assert prefill_wrapper._causal
+                    assert (
+                        prefill_wrapper._causal
+                        == _benchmark_flashinfer_prefill_causal()
+                    )
 
                     if self.is_kvcache_nvfp4:
                         kv_cache_permute = nvfp4_kv_data
@@ -1967,6 +2034,14 @@ class FlashInferImpl(AttentionImpl):
                 else:
                     q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
 
+                decode_mask = None
+                if decode_with_xqa and q_len_per_req > 1:
+                    decode_mask = _get_xqa_spec_decode_causal_mask(
+                        attn_metadata.num_decodes,
+                        q_len_per_req,
+                        decode_query.device,
+                    )
+
                 trtllm_batch_decode_with_kv_cache(
                     query=decode_query,
                     kv_cache=(
@@ -1984,6 +2059,8 @@ class FlashInferImpl(AttentionImpl):
                     out=out,
                     kv_layout=get_kv_cache_layout(),
                     q_len_per_req=q_len_per_req,
+                    backend=decode_kernel.value,
+                    mask=decode_mask,
                     kv_cache_sf=(
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     ),

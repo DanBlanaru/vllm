@@ -62,11 +62,15 @@ def test_supports_batch_invariant_disables():
 
 @patch("vllm.envs.VLLM_BATCH_INVARIANT", False)
 @patch(
+    "vllm.utils.flashinfer.current_platform.is_device_capability",
+    return_value=False,
+)
+@patch(
     "vllm.utils.flashinfer.current_platform.is_device_capability_family",
     return_value=True,
 )
 @patch("vllm.utils.flashinfer.has_nvidia_artifactory", return_value=True)
-def test_supports_sm100_with_artifactory(_art, _cap):
+def test_supports_sm100_with_artifactory(_art, _family, _cap):
     assert supports_trtllm_attention() is True
 
 
@@ -96,11 +100,31 @@ def test_supports_sm90_decode_only(_art, _family, _cap):
 
 @patch("vllm.envs.VLLM_BATCH_INVARIANT", False)
 @patch(
+    "vllm.utils.flashinfer.current_platform.is_device_capability",
+    side_effect=lambda capability: capability == 120,
+)
+@patch(
+    "vllm.utils.flashinfer.current_platform.is_device_capability_family",
+    return_value=False,
+)
+@patch("vllm.utils.flashinfer.has_nvidia_artifactory", return_value=False)
+def test_supports_sm120_decode_only_without_artifactory(_art, _family, _cap):
+    assert supports_trtllm_attention(is_prefill=False) is True
+    assert supports_trtllm_attention(is_prefill=True) is False
+    _art.assert_not_called()
+
+
+@patch("vllm.envs.VLLM_BATCH_INVARIANT", False)
+@patch(
+    "vllm.utils.flashinfer.current_platform.is_device_capability",
+    return_value=False,
+)
+@patch(
     "vllm.utils.flashinfer.current_platform.is_device_capability_family",
     return_value=True,
 )
 @patch("vllm.utils.flashinfer.has_nvidia_artifactory", return_value=False)
-def test_supports_sm100_without_artifactory(_art, _cap):
+def test_supports_sm100_without_artifactory(_art, _family, _cap):
     assert supports_trtllm_attention() is False
 
 

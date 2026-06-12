@@ -227,6 +227,13 @@ class BenchmarkConfig:
     num_kv_splits: int | None = None  # CUTLASS MLA
     reorder_batch_threshold: int | None = None  # FlashAttn MLA, FlashMLA
 
+    # Standard-attention benchmark labels / diagnostics.
+    attention_kernel: str | None = None
+    resolved_backend: str | None = None
+    resolved_internal_path: str | None = None
+    flashinfer_prefill_causal: bool | None = None
+    flashinfer_decode_backend: str | None = None
+
 
 @dataclass
 class BenchmarkResult:
@@ -240,6 +247,10 @@ class BenchmarkResult:
     throughput_tokens_per_sec: float | None = None
     memory_allocated_mb: float | None = None
     memory_reserved_mb: float | None = None
+    speed_vs_triton: float | None = None
+    output_max_abs_diff_vs_triton: float | None = None
+    output_mean_abs_diff_vs_triton: float | None = None
+    output_rms_diff_vs_triton: float | None = None
     error: str | None = None
 
     @property
@@ -258,6 +269,10 @@ class BenchmarkResult:
             "throughput_tokens_per_sec": self.throughput_tokens_per_sec,
             "memory_allocated_mb": self.memory_allocated_mb,
             "memory_reserved_mb": self.memory_reserved_mb,
+            "speed_vs_triton": self.speed_vs_triton,
+            "output_max_abs_diff_vs_triton": self.output_max_abs_diff_vs_triton,
+            "output_mean_abs_diff_vs_triton": self.output_mean_abs_diff_vs_triton,
+            "output_rms_diff_vs_triton": self.output_rms_diff_vs_triton,
             "error": self.error,
         }
 
@@ -319,7 +334,12 @@ class ResultsFormatter:
             table.add_column(col_time, justify="right", no_wrap=False)
             if multi and compare_to_fastest:
                 # Relative performance column
-                col_rel = f"{short_name}\nvs Best"
+                baseline_names = set(backends) & {"triton", "TRITON_ATTN"}
+                col_rel = (
+                    f"{short_name}\nvs Triton"
+                    if baseline_names
+                    else f"{short_name}\nvs Best"
+                )
                 table.add_column(col_rel, justify="right", no_wrap=False)
 
         # Add rows
@@ -327,6 +347,11 @@ class ResultsFormatter:
             spec_results = by_spec[spec]
             times = {b: r.mean_time for b, r in spec_results.items() if r.success}
             best_time = min(times.values()) if times else 0.0
+            triton_time = None
+            for triton_name in ("triton", "TRITON_ATTN"):
+                if triton_name in spec_results and spec_results[triton_name].success:
+                    triton_time = spec_results[triton_name].mean_time
+                    break
 
             batch_type = get_batch_type(spec)
             batch_size = len(parse_batch_spec(spec))
@@ -337,13 +362,22 @@ class ResultsFormatter:
                     if r.success:
                         row.append(f"{r.mean_time:.6f}")
                         if multi and compare_to_fastest:
-                            pct = (
-                                (r.mean_time / best_time * 100) if best_time > 0 else 0
-                            )
-                            pct_str = f"{pct:.1f}%"
-                            if r.mean_time == best_time:
-                                pct_str = f"[bold green]{pct_str}[/]"
-                            row.append(pct_str)
+                            if triton_time is not None and r.mean_time > 0:
+                                speed = triton_time / r.mean_time
+                                speed_str = f"{speed:.2f}x"
+                                if backend in ("triton", "TRITON_ATTN"):
+                                    speed_str = f"[bold green]{speed_str}[/]"
+                                row.append(speed_str)
+                            else:
+                                pct = (
+                                    (r.mean_time / best_time * 100)
+                                    if best_time > 0
+                                    else 0
+                                )
+                                pct_str = f"{pct:.1f}%"
+                                if r.mean_time == best_time:
+                                    pct_str = f"[bold green]{pct_str}[/]"
+                                row.append(pct_str)
                     else:
                         row.append("[red]ERROR[/]")
                         if multi and compare_to_fastest:
@@ -355,6 +389,32 @@ class ResultsFormatter:
 
             table.add_row(*row)
 
+        self.console.print(table)
+        self._print_triton_divergence(results)
+
+    def _print_triton_divergence(self, results: list[BenchmarkResult]):
+        rows = [
+            r
+            for r in results
+            if r.success and r.output_max_abs_diff_vs_triton is not None
+        ]
+        if not rows:
+            return
+
+        table = Table(title="Output Divergence vs Triton")
+        table.add_column("Batch\nSpec", no_wrap=True)
+        table.add_column("Backend", no_wrap=True)
+        table.add_column("max |diff|", justify="right", no_wrap=True)
+        table.add_column("mean |diff|", justify="right", no_wrap=True)
+        table.add_column("rms diff", justify="right", no_wrap=True)
+        for r in rows:
+            table.add_row(
+                r.config.batch_spec,
+                r.config.backend,
+                f"{r.output_max_abs_diff_vs_triton:.6e}",
+                f"{r.output_mean_abs_diff_vs_triton:.6e}",
+                f"{r.output_rms_diff_vs_triton:.6e}",
+            )
         self.console.print(table)
 
     def save_csv(self, results: list[BenchmarkResult], path: str):
@@ -370,6 +430,9 @@ class ResultsFormatter:
                 f,
                 fieldnames=[
                     "backend",
+                    "attention_kernel",
+                    "resolved_backend",
+                    "resolved_internal_path",
                     "batch_spec",
                     "num_layers",
                     "kv_cache_dtype",
@@ -377,6 +440,10 @@ class ResultsFormatter:
                     "std_time",
                     "throughput",
                     "memory_mb",
+                    "speed_vs_triton",
+                    "output_max_abs_diff_vs_triton",
+                    "output_mean_abs_diff_vs_triton",
+                    "output_rms_diff_vs_triton",
                 ],
             )
             writer.writeheader()
@@ -384,6 +451,10 @@ class ResultsFormatter:
                 writer.writerow(
                     {
                         "backend": r.config.backend,
+                        "attention_kernel": r.config.attention_kernel or "",
+                        "resolved_backend": r.config.resolved_backend or "",
+                        "resolved_internal_path": r.config.resolved_internal_path
+                        or "",
                         "batch_spec": r.config.batch_spec,
                         "num_layers": r.config.num_layers,
                         "kv_cache_dtype": r.config.kv_cache_dtype,
@@ -391,6 +462,26 @@ class ResultsFormatter:
                         "std_time": r.std_time,
                         "throughput": r.throughput_tokens_per_sec or 0,
                         "memory_mb": r.memory_allocated_mb or 0,
+                        "speed_vs_triton": (
+                            r.speed_vs_triton
+                            if r.speed_vs_triton is not None
+                            else ""
+                        ),
+                        "output_max_abs_diff_vs_triton": (
+                            r.output_max_abs_diff_vs_triton
+                            if r.output_max_abs_diff_vs_triton is not None
+                            else ""
+                        ),
+                        "output_mean_abs_diff_vs_triton": (
+                            r.output_mean_abs_diff_vs_triton
+                            if r.output_mean_abs_diff_vs_triton is not None
+                            else ""
+                        ),
+                        "output_rms_diff_vs_triton": (
+                            r.output_rms_diff_vs_triton
+                            if r.output_rms_diff_vs_triton is not None
+                            else ""
+                        ),
                     }
                 )
 

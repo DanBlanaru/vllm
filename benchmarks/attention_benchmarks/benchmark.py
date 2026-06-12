@@ -454,6 +454,14 @@ def main():
         help="Single backend (alternative to --backends)",
     )
     parser.add_argument(
+        "--attention-kernels",
+        nargs="+",
+        help=(
+            "Logical standard-attention kernel labels, e.g. triton, "
+            "fi_prefill_noncausal, fi_prefill_causal, xqa_decode_causal"
+        ),
+    )
+    parser.add_argument(
         "--prefill-backends",
         nargs="+",
         help="Prefill backends to compare (fa2, fa3, fa4). "
@@ -528,11 +536,19 @@ def main():
 
         # Override args with YAML values, but CLI args take precedence
         # Check if CLI provided backends (they would be non-None and not default)
-        cli_backends_provided = args.backend is not None or args.backends is not None
+        cli_backends_provided = (
+            args.backend is not None
+            or args.backends is not None
+            or args.attention_kernels is not None
+        )
 
         # Backend(s) - only use YAML if CLI didn't specify
         if not cli_backends_provided:
-            if "backend" in yaml_config:
+            if "attention_kernels" in yaml_config:
+                args.attention_kernels = yaml_config["attention_kernels"]
+                args.backends = None
+                args.backend = None
+            elif "backend" in yaml_config:
                 args.backend = yaml_config["backend"]
                 args.backends = None
             elif "backends" in yaml_config:
@@ -645,11 +661,18 @@ def main():
         )
 
     # Determine backends
-    backends = args.backends or ([args.backend] if args.backend else ["flash"])
+    using_attention_kernels = args.attention_kernels is not None
+    backends = (
+        args.attention_kernels
+        or args.backends
+        or ([args.backend] if args.backend else ["flash"])
+    )
     prefill_backends = getattr(args, "prefill_backends", None)
     if not args.batch_specs:
         args.batch_specs = ["q2k", "8q1s1k"]
     console.print(f"Backends: {', '.join(backends)}")
+    if using_attention_kernels:
+        console.print("[dim]Using logical attention kernel labels[/]")
     if prefill_backends:
         console.print(f"Prefill backends: {', '.join(prefill_backends)}")
     console.print(f"Batch specs: {', '.join(args.batch_specs)}")
@@ -911,6 +934,9 @@ def main():
                     for backend in backends:
                         config = BenchmarkConfig(
                             backend=backend,
+                            attention_kernel=backend
+                            if using_attention_kernels
+                            else None,
                             batch_spec=spec,
                             num_layers=args.num_layers,
                             head_dim=args.head_dim,
