@@ -458,7 +458,8 @@ def main():
         nargs="+",
         help=(
             "Logical standard-attention kernel labels, e.g. triton, "
-            "fi_prefill_noncausal, fi_prefill_causal, xqa_decode_causal"
+            "fi_decode_native, fi_prefill_noncausal, fi_prefill_causal, "
+            "xqa_decode_causal"
         ),
     )
     parser.add_argument(

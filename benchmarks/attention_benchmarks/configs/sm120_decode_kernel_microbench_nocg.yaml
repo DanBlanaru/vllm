@@ -1,0 +1,78 @@
+# Same context-count/ISL grid as the q8 specdec microbench, but with q_len=1
+# regular decode requests instead of q_len=8 speculative decode / extend.
+
+description: "SM120 q1 decode kernel comparison (no CUDA graphs)"
+
+attention_kernels:
+  - triton
+  - fi_decode_native
+  - xqa_decode_causal
+
+model:
+  num_layers: 10
+  num_q_heads: 32
+  num_kv_heads: 8
+  head_dim: 128
+  block_size: 16
+
+batch_specs:
+  - "q1s1k"
+  - "q1s2k"
+  - "q1s4k"
+  - "q1s8k"
+  - "q1s16k"
+  - "q1s32k"
+  - "q1s64k"
+  - "2q1s1k"
+  - "2q1s2k"
+  - "2q1s4k"
+  - "2q1s8k"
+  - "2q1s16k"
+  - "2q1s32k"
+  - "2q1s64k"
+  - "4q1s1k"
+  - "4q1s2k"
+  - "4q1s4k"
+  - "4q1s8k"
+  - "4q1s16k"
+  - "4q1s32k"
+  - "4q1s64k"
+  - "8q1s1k"
+  - "8q1s2k"
+  - "8q1s4k"
+  - "8q1s8k"
+  - "8q1s16k"
+  - "8q1s32k"
+  - "8q1s64k"
+  - "16q1s1k"
+  - "16q1s2k"
+  - "16q1s4k"
+  - "16q1s8k"
+  - "16q1s16k"
+  - "16q1s32k"
+  - "16q1s64k"
+  - "32q1s1k"
+  - "32q1s2k"
+  - "32q1s4k"
+  - "32q1s8k"
+  - "32q1s16k"
+  - "32q1s32k"
+  - "32q1s64k"
+  - "64q1s1k"
+  - "64q1s2k"
+  - "64q1s4k"
+  - "64q1s8k"
+  - "64q1s16k"
+  - "64q1s32k"
+  - "64q1s64k"
+
+kv_cache_dtype: fp8
+device: "cuda:0"
+repeats: 10
+warmup_iters: 5
+cuda_graphs: false
+profile_memory: false
+
+output:
+  csv: "sm120_decode_kernel_microbench_grid_nocg.csv"
+  json: "sm120_decode_kernel_microbench_grid_nocg.json"

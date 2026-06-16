@@ -13,7 +13,8 @@ from pathlib import Path
 
 BENCH_ROOT = Path("/home/scratch/scratch.dblanaru/bench_serving")
 DEFAULT_EXPERIMENT_DIR = BENCH_ROOT / "artifacts/sm120_specdec_kernel_microbench"
-TRITON_XQA_FILENAMES = (
+RESULT_FILENAMES = (
+    "triton_fi_xqa_nocg.json",
     "triton_xqa_nocg.json",
     "triton_xqa_16q8s64k.json",
     "triton_xqa_64q8s64k.json",
@@ -35,6 +36,11 @@ def parse_args() -> Namespace:
             "Experiment artifact folder. The postprocessor reads raw/ inputs "
             "and writes fi_indexed.* / triton_indexed.* here."
         ),
+    )
+    parser.add_argument(
+        "--fi-backend",
+        default="fi_prefill_noncausal",
+        help="Logical FI backend label to use as the FI-indexed baseline.",
     )
     parser.add_argument(
         "--triton-xqa-json",
@@ -84,10 +90,20 @@ def resolve_paths(args: Namespace) -> Namespace:
     raw_dir = experiment_dir / "raw"
     if args.triton_xqa_jsons is None:
         args.triton_xqa_jsons = [
-            raw_dir / name for name in TRITON_XQA_FILENAMES if (raw_dir / name).exists()
+            raw_dir / name for name in RESULT_FILENAMES if (raw_dir / name).exists()
         ]
+        args.triton_xqa_jsons.extend(
+            sorted((raw_dir / "decode_one_by_one/json").glob("*.json"))
+        )
+        args.triton_xqa_jsons.extend(
+            sorted((raw_dir / "xqa_only_failed_fi/json").glob("*.json"))
+        )
     if args.fi_summary is None:
-        args.fi_summary = raw_dir / "fi_noncausal_one_by_one/summary.csv"
+        fi_one_by_one = raw_dir / "fi_noncausal_one_by_one/summary.csv"
+        decode_one_by_one = raw_dir / "decode_one_by_one/summary.csv"
+        args.fi_summary = (
+            fi_one_by_one if fi_one_by_one.exists() else decode_one_by_one
+        )
     if args.out_md is None:
         args.out_md = experiment_dir / "triton_indexed.md"
     if args.out_csv is None:
@@ -125,14 +141,18 @@ def status_from_summary_row(summary_row: dict) -> str:
 def status_from_invalid_result(result: dict | None) -> str:
     if result is None:
         return "NO_FI_ROW"
-    if not math.isfinite(result.get("mean_time", math.inf)):
-        return "BENCH_INF"
     if result.get("error") is not None:
+        if "out of memory" in result["error"].lower():
+            return "BENCH_OOM"
         return "BENCH_ERR"
+    if not math.isfinite(result.get("mean_time", math.inf)):
+        return "BENCH_NONFINITE"
     return "ERR"
 
 
-def load_fi_data(fi_summary: Path) -> tuple[dict[str, str], dict[str, dict]]:
+def load_fi_data(
+    fi_summary: Path, fi_backend: str
+) -> tuple[dict[str, str], dict[str, dict]]:
     statuses = {}
     rows = {}
     if not fi_summary.exists():
@@ -145,18 +165,42 @@ def load_fi_data(fi_summary: Path) -> tuple[dict[str, str], dict[str, dict]]:
                 continue
             json_path = Path(summary_row["json"])
             if not json_path.exists():
-                statuses[spec] = "MISSING_JSON"
-                continue
+                relocated_json_path = fi_summary.parent / "json" / json_path.name
+                if relocated_json_path.exists():
+                    json_path = relocated_json_path
+                else:
+                    statuses[spec] = "MISSING_JSON"
+                    continue
             fi_result = None
             with json_path.open() as jf:
                 for result in json.load(jf):
-                    if result["config"]["backend"] == "fi_prefill_noncausal":
+                    if result["config"]["backend"] == fi_backend:
                         fi_result = result
                         break
             if is_valid_result(fi_result):
                 rows[spec] = fi_result
             else:
                 statuses[spec] = status_from_invalid_result(fi_result)
+    return statuses, rows
+
+
+def load_fi_data_from_result_files(
+    paths: list[Path], fi_backend: str
+) -> tuple[dict[str, str], dict[str, dict]]:
+    rows = {}
+    statuses = {}
+    for path in paths:
+        with path.open() as f:
+            for row in json.load(f):
+                config = row["config"]
+                if config["backend"] != fi_backend:
+                    continue
+                spec = config["batch_spec"]
+                if is_valid_result(row):
+                    rows[spec] = row
+                    statuses[spec] = "OK"
+                else:
+                    statuses[spec] = status_from_invalid_result(row)
     return statuses, rows
 
 
@@ -229,7 +273,12 @@ def main() -> None:
         )
 
     tx = load_results(triton_xqa_jsons)
-    fi_status, fi_rows_by_spec = load_fi_data(args.fi_summary)
+    if args.fi_summary.exists():
+        fi_status, fi_rows_by_spec = load_fi_data(args.fi_summary, args.fi_backend)
+    else:
+        fi_status, fi_rows_by_spec = load_fi_data_from_result_files(
+            triton_xqa_jsons, args.fi_backend
+        )
     specs = sorted(
         {spec for spec, _ in tx} | set(fi_status),
         key=spec_sort_key,

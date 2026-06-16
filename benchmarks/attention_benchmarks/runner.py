@@ -43,6 +43,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec, get_kv_quant_mode
 
 ATTENTION_KERNEL_BACKENDS = {
     "triton": "TRITON_ATTN",
+    "fi_decode_native": "FLASHINFER",
     "fi_prefill_noncausal": "FLASHINFER",
     "fi_prefill_causal": "FLASHINFER",
     "xqa_decode_causal": "FLASHINFER",
@@ -239,6 +240,8 @@ def _create_vllm_config(
     )
     if config.attention_kernel == "xqa_decode_causal":
         vllm_config.attention_config.use_trtllm_attention = True
+    elif config.attention_kernel == "fi_decode_native":
+        vllm_config.attention_config.use_trtllm_attention = False
     return vllm_config
 
 
@@ -642,9 +645,8 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
             # Set KV cache layout if the backend requires a specific one
             # (e.g., FlashInfer requires HND on SM100/Blackwell for TRTLLM attention)
             required_layout = backend_class.get_required_kv_cache_layout()
-            if required_layout is not None:
-                set_kv_cache_layout(required_layout)
-                get_kv_cache_layout.cache_clear()
+            set_kv_cache_layout(required_layout)
+            get_kv_cache_layout.cache_clear()
 
             common_metadata = _build_common_attn_metadata(
                 q_lens, kv_lens, config.block_size, device
