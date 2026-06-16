@@ -7,8 +7,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-BENCH_ROOT="$(cd -- "${SCRIPT_DIR}/../../.." && pwd)"
-EXPERIMENT_DIR="${EXPERIMENT_DIR:-${BENCH_ROOT}/artifacts/sm120_decode_random_kv_audit}"
+REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
+PYTHON="${PYTHON:-python}"
+EXPERIMENT_DIR="${EXPERIMENT_DIR:-${REPO_ROOT}/artifacts/sm120_decode_random_kv_audit}"
 OUT_DIR="${OUT_DIR:-${EXPERIMENT_DIR}/raw/decode_one_by_one}"
 
 mkdir -p "${OUT_DIR}/json" "${OUT_DIR}/csv" "${OUT_DIR}/logs"
@@ -33,29 +34,25 @@ for spec in "${specs[@]}"; do
   rm -f "${json}" "${csv}" "${log}"
 
   echo "=== ${spec} ==="
-  cid="$(
-    make -s -C "${BENCH_ROOT}" container-launch-vllm-detach \
-      VLLM_DIR=vllm-sm120-specdec-kernel-bench \
-      RUN_CMD="bash -lc 'cd ${BENCH_ROOT}/vllm-sm120-specdec-kernel-bench/benchmarks/attention_benchmarks && python benchmark.py --config configs/sm120_decode_kernel_microbench_nocg.yaml --batch-specs ${spec} --output-json ${json} --output-csv ${csv}'" \
-      | tail -n 1
-  )"
-  echo "container=${cid}" | tee "${log}"
   set +e
-  exit_code="$(docker wait "${cid}")"
-  wait_status=$?
-  docker logs "${cid}" >> "${log}" 2>&1
+  (
+    cd "${SCRIPT_DIR}"
+    "${PYTHON}" benchmark.py \
+      --config configs/sm120_decode_kernel_microbench_nocg.yaml \
+      --batch-specs "${spec}" \
+      --output-json "${json}" \
+      --output-csv "${csv}"
+  ) > "${log}" 2>&1
+  exit_code="$?"
   set -e
 
-  if [[ "${wait_status}" -ne 0 ]]; then
-    status="DOCKER_WAIT_ERR"
-    exit_code="${wait_status}"
-  elif [[ "${exit_code}" == "0" && -s "${json}" ]]; then
+  if [[ "${exit_code}" == "0" && -s "${json}" ]]; then
     status="OK"
   else
     status="ERR"
   fi
   printf "%s,%s,%s,%s,%s,%s\n" \
-    "${spec}" "${status}" "${cid}" "${exit_code}" "${json}" "${log}" >> "${summary}"
+    "${spec}" "${status}" "local" "${exit_code}" "${json}" "${log}" >> "${summary}"
   echo "${spec}: ${status} exit=${exit_code}"
 done
 

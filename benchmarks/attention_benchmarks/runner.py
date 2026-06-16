@@ -175,15 +175,20 @@ def _build_common_attn_metadata(
 def _create_vllm_config(
     config: BenchmarkConfig,
     max_num_blocks: int,
+    max_model_len: int,
 ) -> VllmConfig:
     """Create a VllmConfig for benchmarking with mock model methods."""
+    max_model_len = max(max_model_len, 1024)
+    # The attention microbench uses synthetic metadata and can exceed the
+    # public mock model's advertised context length.
+    os.environ.setdefault("VLLM_ALLOW_LONG_MAX_MODEL_LEN", "1")
     model_config = ModelConfig(
         model="Qwen/Qwen2.5-0.5B",
         tokenizer="Qwen/Qwen2.5-0.5B",
         trust_remote_code=False,
         dtype="auto",  # Use model's native dtype
         seed=0,
-        max_model_len=1024,
+        max_model_len=max_model_len,
     )
 
     cache_config = CacheConfig(
@@ -197,7 +202,7 @@ def _create_vllm_config(
     scheduler_config = SchedulerConfig(
         max_num_seqs=256,
         max_num_batched_tokens=8192,
-        max_model_len=8192,
+        max_model_len=max_model_len,
         is_encoder_decoder=False,
         enable_chunked_prefill=True,
     )
@@ -632,7 +637,7 @@ def run_attention_benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     # Suppress vLLM logs during setup to reduce spam
     with log_warnings_and_errors_only(), benchmark_flashinfer_env(config):
         # Create vllm_config first - uses model's native dtype via "auto"
-        vllm_config = _create_vllm_config(config, max_num_blocks)
+        vllm_config = _create_vllm_config(config, max_num_blocks, max_kv)
         dtype = vllm_config.model_config.dtype
 
         # Wrap everything in set_current_vllm_config context
