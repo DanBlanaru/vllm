@@ -19,12 +19,16 @@ bottlenecks before it measures the bare XQA decode kernel:
 - EAGLE3 speculation gives a uniform model-based path that can exercise XQA,
   but vLLM's padded EAGLE bookkeeping introduces tiny D2H synchronization
   points for accepted-token counts. These can dominate some e2e cases.
+- MiMo MTP gives a cleaner standard-GQA model-based path. On MiMo-7B, FI+XQA
+  consistently beats FAv3 on SPEED-Bench, suggesting the EAGLE3 c32 miss is not
+  a general MTP/XQA limitation.
 - Long-context SPEED-Bench also includes substantial prefill work, which dilutes
   decode-kernel wins.
 
 The current state is: correctness is good, the kernel microbench is positive in
-the expected FP8/high-batch region, and a few e2e cases show XQA wins. The
-remaining work is to separate kernel performance from vLLM spec-decode
+the expected FP8/high-batch region, and e2e cases show XQA wins when the
+speculative path avoids EAGLE bookkeeping or reaches high enough active batch.
+The remaining work is to separate kernel performance from vLLM spec-decode
 bookkeeping and to expose ragged XQA support through FlashInfer for model-free
 ngram testing.
 
@@ -205,6 +209,46 @@ Interpretation:
 - Acceptance is matched, so the slow points are not explained by worse EAGLE3
   quality on XQA.
 
+### MTP, MiMo-7B Standard GQA, Fast Case
+
+Artifact:
+
+`artifacts/mimo-7b-base-mtp-speedbench-concurrency_20260701_1445/summary.md`
+
+Config:
+
+- Verifier/model: `XiaomiMiMo/MiMo-7B-Base`
+- Architecture: standard decoder-only Transformer with GQA, not Qwen3.6/Gemma
+  hybrid linear/sliding attention.
+- Spec config: MTP, 1 draft token.
+- Dataset: SPEED-Bench `low_entropy`
+- Subsets: `throughput_8k`, `throughput_16k`
+- Prompts per case: `64`
+- OSL: `500`
+- Concurrencies: `8`, `16`, `32`, `64`
+- KV cache: FP8
+
+Result:
+
+| ISL | max concurrency | FAv3 out tok/s | FI+XQA out tok/s | XQA / FAv3 | FAv3 TPOT ms | FI+XQA TPOT ms | FAv3 accept % | FI+XQA accept % |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 8k | 8 | 934.03 | 1012.48 | 1.084x | 7.15 | 6.91 | 92.11 | 93.94 |
+| 8k | 16 | 2644.71 | 2819.96 | 1.066x | 5.44 | 4.92 | 92.50 | 92.89 |
+| 8k | 32 | 3551.00 | 4426.38 | 1.247x | 6.82 | 5.72 | 91.88 | 93.22 |
+| 8k | 64 | 4587.54 | 5238.62 | 1.142x | 9.53 | 8.22 | 92.24 | 93.55 |
+| 16k | 8 | 623.64 | 625.61 | 1.003x | 11.09 | 11.72 | 96.55 | 94.82 |
+| 16k | 16 | 2088.75 | 2222.30 | 1.064x | 6.84 | 6.45 | 97.30 | 96.37 |
+| 16k | 32 | 2588.61 | 3393.39 | 1.311x | 9.87 | 7.92 | 97.23 | 95.84 |
+| 16k | 64 | 2978.44 | 3499.05 | 1.175x | 16.13 | 13.94 | 96.89 | 96.11 |
+
+Interpretation:
+
+This is the strongest e2e evidence that XQA wins when the model-based
+speculative path is not dominated by EAGLE3 bookkeeping. MiMo is much smaller
+than Qwen3-30B-A3B, so it is not a scale-matched substitute, but it is a cleaner
+standard-GQA MTP probe. The high and matched MTP acceptance (`~92-97%`) also
+shows that the previous EAGLE3 c32 miss was not a general MTP/XQA failure.
+
 ### Ngram, Model-Free, Slow Case
 
 Artifacts:
@@ -359,6 +403,7 @@ Candidate model directions under the Qwen3-235B cap:
 
 | Candidate | Why it is relevant | Caveats |
 | --- | --- | --- |
+| `XiaomiMiMo/MiMo-7B-Base` or `XiaomiMiMo/MiMo-7B-RL-0530` | Cleanest standard decoder-only GQA + native MTP probe found so far. Local vLLM has `MiMoForCausalLM` and `MiMoMTPModel`; SPEED-Bench shows FI+XQA wins across tested 8k/16k concurrency points. | Only 7B, so not scale-matched to Qwen3-30B-A3B or Qwen3-235B. Local vLLM MiMo MTP supports `num_speculative_tokens=1` only. |
 | `Qwen/Qwen3.6-27B` or compatible MTP variants | Closest Qwen-family size to the current 30B target; model cards show MTP usage with vLLM. | Different architecture from Qwen3-30B-A3B; some public variants are AWQ/INT4 grafts and may add quantization confounds. |
 | `shawnw3i/Qwen3.6-27B-AWQ-MTP` | Single-GPU-ish quantized MTP checkpoint with explicit vLLM MTP example. | Not a clean FP8 Qwen checkpoint; third-party packaging. |
 | `hampsonw/Qwen3.6-27B-AWQ-BF16-INT4-mtp-bf16` | MTP tensors grafted as BF16 for vLLM MTP. | Quantized main model; useful for path testing, less clean for kernel claims. |
@@ -376,13 +421,21 @@ similar bookkeeping. Therefore MTP is a useful experiment, but the question is:
 does a given MTP implementation avoid the EAGLE padded accepted-count sync, or
 does it hit the same vLLM synchronization pattern?
 
-Suggested MTP next test:
+MTP test already completed:
 
-1. Start with a Qwen-family MTP candidate, ideally `Qwen3.6-27B` or a known
-   vLLM-compatible MTP variant under the Qwen3-235B cap.
-2. Use `num_speculative_tokens=1` first.
-3. Run a small FAv3 vs FI+XQA pair on ShareGPT or SPEED-Bench 16k/c32.
-4. Profile only if e2e behavior is surprising.
+```bash
+MODEL=XiaomiMiMo/MiMo-7B-Base \
+NUM_SPEC_TOKENS=1 \
+bash /home/scratch/scratch.dblanaru/bench_serving/xqa_repros/mimo_mtp_speedbench_concurrency.sh
+```
+
+Suggested further MTP tests:
+
+1. If a scale-matched standard-GQA MTP model appears, repeat the MiMo
+   SPEED-Bench sweep on that model.
+2. If testing Qwen3.6/Qwen3-Next, treat it as a hybrid-attention MTP
+   bookkeeping experiment, not a clean XQA kernel experiment.
+3. Profile only if e2e behavior is surprising.
 
 Example shape:
 
@@ -503,9 +556,10 @@ rm -rf ~/.cache/flashinfer
    - Do not claim a blanket EAGLE3 speedup.
 
 2. For model-based uniform testing:
-   - Try MTP with a compatible model, preferably Qwen-family if available.
-   - Start at `num_speculative_tokens=1`.
-   - Check whether MTP avoids the EAGLE accepted-count D2H synchronization.
+   - Use MiMo-7B as the clean standard-GQA MTP proof point.
+   - Keep looking for a larger standard-GQA MTP model under the Qwen3-235B cap.
+   - Treat Qwen3.6/Qwen3-Next, Gemma 4, and similar hybrid-attention models as
+     useful bookkeeping probes, but not clean XQA-kernel proxies.
 
 3. For model-free ngram testing:
    - Treat ragged XQA as a FlashInfer C++/binding/vLLM integration project.
