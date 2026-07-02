@@ -671,6 +671,24 @@ def test_flashinfer_xqa_spec_decode_causal_mask():
     assert torch.equal(mask[..., 1], torch.zeros((2, 3), dtype=torch.uint16))
 
 
+def test_flashinfer_xqa_ragged_spec_decode_causal_mask():
+    from vllm.v1.attention.backends.flashinfer import (
+        _get_xqa_ragged_spec_decode_causal_mask,
+    )
+
+    cum_seq_lens_q = torch.tensor([0, 1, 4, 6], dtype=torch.int32)
+    mask = _get_xqa_ragged_spec_decode_causal_mask(
+        cum_seq_lens_q, 3, 6, torch.device("cpu")
+    )
+
+    assert mask.shape == (6, 2)
+    torch.testing.assert_close(
+        mask[:, 0],
+        torch.tensor([0b001, 0b001, 0b011, 0b111, 0b001, 0b011], dtype=torch.uint16),
+    )
+    assert torch.equal(mask[:, 1], torch.zeros(6, dtype=torch.uint16))
+
+
 @pytest.mark.skipif(
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
     reason="FlashInfer is not available.",
@@ -806,6 +824,98 @@ def test_flashinfer_sm90_xqa_spec_decode_correctness(default_vllm_config):
         is_prefill=False,
     ):
         pytest.skip("FlashInfer XQA decode is not available in this setup.")
+
+    _test_backend_correctness(
+        batch_spec,
+        "meta-llama/Meta-Llama-3-8B",
+        [AttentionBackendEnum.FLASHINFER],
+        causal_mask_mod,
+        vllm_config_transform=enable_spec_decode,
+    )
+
+
+@pytest.mark.skipif(
+    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
+    reason="FlashInfer is not available.",
+)
+def test_flashinfer_sm90_xqa_ragged_spec_decode_correctness(default_vllm_config):
+    """SM90 XQA should keep ragged ngram-style verification on decode."""
+    if not current_platform.is_cuda() or not current_platform.is_device_capability(90):
+        pytest.skip("FlashInfer XQA decode requires SM90.")
+
+    import unittest.mock
+
+    from vllm.config import SpeculativeConfig, set_current_vllm_config
+    from vllm.utils.flashinfer import can_use_trtllm_attention
+    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+    from vllm.v1.attention.backends.utils import PerLayerParameters
+
+    def causal_mask_mod(
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+        *,
+        context_len: int,
+    ):
+        return (q_idx + context_len) >= kv_idx
+
+    def enable_spec_decode(vllm_config):
+        vllm_config.speculative_config = SpeculativeConfig(
+            num_speculative_tokens=4,
+            method="ngram",
+            target_model_config=vllm_config.model_config,
+            target_parallel_config=vllm_config.parallel_config,
+        )
+
+    def mock_get_per_layer_parameters(vllm_config, layer_names, impl_cls):
+        return {
+            "placeholder": PerLayerParameters(
+                window_left=-1,
+                logits_soft_cap=0.0,
+                sm_scale=1.0,
+            )
+        }
+
+    batch_spec = BatchSpec(seq_lens=[35, 43, 39], query_lens=[3, 1, 4])
+    vllm_config = create_vllm_config(
+        model_name="meta-llama/Meta-Llama-3-8B",
+        max_model_len=max(batch_spec.seq_lens),
+        block_size=16,
+    )
+    enable_spec_decode(vllm_config)
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    device = torch.device(f"{DEVICE_TYPE}:0")
+    with set_current_vllm_config(vllm_config):
+        if not can_use_trtllm_attention(
+            vllm_config.model_config.get_num_attention_heads(
+                vllm_config.parallel_config
+            ),
+            kv_cache_spec.num_kv_heads,
+            is_prefill=False,
+        ):
+            pytest.skip("FlashInfer XQA decode is not available in this setup.")
+
+        with unittest.mock.patch(
+            "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
+            mock_get_per_layer_parameters,
+        ):
+            builder = flashinfer_backend.FlashInferMetadataBuilder(
+                kv_cache_spec, ["placeholder"], vllm_config, device
+            )
+            common_attn_metadata = create_common_attn_metadata(
+                batch_spec, vllm_config.cache_config.block_size, device
+            )
+            attn_metadata = builder.build(0, common_attn_metadata)
+
+    assert isinstance(
+        attn_metadata.decode,
+        flashinfer_backend.FlashInferTrtllmAPIDecode,
+    )
+    assert attn_metadata.decode.kernel == flashinfer_backend.FlashInferDecodeKernel.XQA
+    assert attn_metadata.decode.is_ragged
+    assert attn_metadata.decode.max_q_len == 4
+    assert attn_metadata.prefill is None
 
     _test_backend_correctness(
         batch_spec,

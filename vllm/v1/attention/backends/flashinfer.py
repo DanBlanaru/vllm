@@ -130,6 +130,40 @@ def _get_xqa_spec_decode_causal_mask(
     return mask_uint32.view(torch.uint16)
 
 
+def _get_xqa_ragged_spec_decode_causal_mask(
+    cum_seq_lens_q: torch.Tensor,
+    max_q_len: int,
+    num_query_tokens: int,
+    device: torch.device,
+) -> torch.Tensor:
+    num_packed_masks_per_token = (max_q_len + 31) // 32
+    padded_seq_len = num_packed_masks_per_token * 32
+
+    q_lens = cum_seq_lens_q[1:] - cum_seq_lens_q[:-1]
+    req_starts = torch.repeat_interleave(cum_seq_lens_q[:-1], q_lens)
+    row_q_lens = torch.repeat_interleave(q_lens, q_lens)
+    local_q_indices = (
+        torch.arange(num_query_tokens, device=device, dtype=torch.int32) - req_starts
+    )
+    kv_indices = torch.arange(padded_seq_len, device=device, dtype=torch.int32)
+    causal_bool_mask = (kv_indices.unsqueeze(0) < row_q_lens.unsqueeze(1)) & (
+        kv_indices.unsqueeze(0) <= local_q_indices.unsqueeze(1)
+    )
+
+    causal_bool_mask = causal_bool_mask.view(
+        num_query_tokens, num_packed_masks_per_token, 32
+    )
+    bit_positions = torch.tensor(
+        [1 << i for i in range(32)],
+        device=device,
+        dtype=torch.int64,
+    )
+    mask_uint32 = (
+        (causal_bool_mask.to(torch.int64) * bit_positions).sum(dim=-1).to(torch.uint32)
+    )
+    return mask_uint32.contiguous().view(torch.uint16)
+
+
 def _get_trtllm_workspace_buffer():
     global trtllm_workspace_buffer
     if trtllm_workspace_buffer is None:
@@ -592,6 +626,21 @@ class FlashInferTrtllmAPIDecode:
 
     max_seq_len: int
     """The maximum sequence length for KV Cache."""
+
+    cum_seq_lens_q: torch.Tensor | None = None
+    """
+    Cumulative query lengths for ragged speculative decode requests.
+    Shape: [num_decodes + 1]. None for uniform decode.
+    """
+
+    max_q_len: int = 1
+    """The maximum query length among decode requests."""
+
+    is_ragged: bool = False
+    """Whether decode query lengths are variable across requests."""
+
+    mask: torch.Tensor | None = None
+    """Optional XQA spec-decode causal mask, shared across layers."""
 
 
 @dataclass
@@ -1089,12 +1138,18 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         causal = common_attn_metadata.causal
+        supports_ragged_xqa_decode = (
+            causal
+            and self.use_trtllm_decode_attention
+            and self.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.XQA
+            and self.dcp_world_size <= 1
+        )
         if causal:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
                 split_decodes_and_prefills(
                     common_attn_metadata,
                     decode_threshold=self.reorder_batch_threshold,
-                    require_uniform=True,
+                    require_uniform=not supports_ragged_xqa_decode,
                 )
             )
         else:
@@ -1412,16 +1467,59 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         ## DECODE PATHWAY
         if num_decodes > 0:
             if decode_with_flashinfer_trtllm_api:
-                assert num_decode_tokens % num_decodes == 0, (
-                    "XQA/trtllm-gen decode requires uniform query lengths per request. "
-                    f"Got {num_decode_tokens=} and {num_decodes=}."
-                )
                 assert self.flashinfer_trtllm_api_decode_kernel is not None
+                qo_indptr_decode = qo_indptr[: num_decodes + 1]
+                query_lens_decode_cpu = (
+                    qo_indptr_cpu[1 : num_decodes + 1] - qo_indptr_cpu[:num_decodes]
+                )
+                if (
+                    self.flashinfer_trtllm_api_decode_kernel
+                    == FlashInferDecodeKernel.XQA
+                ):
+                    max_q_len_decode = int(query_lens_decode_cpu.max().item())
+                    is_ragged_decode = not torch.all(
+                        (query_lens_decode_cpu == query_lens_decode_cpu[0])
+                        | (query_lens_decode_cpu == 0)
+                    )
+                    cum_seq_lens_q = (
+                        qo_indptr_decode - qo_indptr_decode[0]
+                        if is_ragged_decode
+                        else None
+                    )
+                    if is_ragged_decode and max_q_len_decode > 1:
+                        assert cum_seq_lens_q is not None
+                        decode_mask = _get_xqa_ragged_spec_decode_causal_mask(
+                            cum_seq_lens_q,
+                            max_q_len_decode,
+                            num_decode_tokens,
+                            self.device,
+                        )
+                    elif max_q_len_decode > 1:
+                        decode_mask = _get_xqa_spec_decode_causal_mask(
+                            num_decodes,
+                            max_q_len_decode,
+                            self.device,
+                        )
+                    else:
+                        decode_mask = None
+                else:
+                    assert num_decode_tokens % num_decodes == 0, (
+                        "trtllm-gen decode requires uniform query lengths per request. "
+                        f"Got {num_decode_tokens=} and {num_decodes=}."
+                    )
+                    max_q_len_decode = num_decode_tokens // num_decodes
+                    is_ragged_decode = False
+                    cum_seq_lens_q = None
+                    decode_mask = None
                 attn_metadata.decode = FlashInferTrtllmAPIDecode(
                     kernel=self.flashinfer_trtllm_api_decode_kernel,
                     block_tables=block_table_tensor[:num_decodes],
                     seq_lens=seq_lens[:num_decodes],
                     max_seq_len=max_seq_len,
+                    cum_seq_lens_q=cum_seq_lens_q,
+                    max_q_len=max_q_len_decode,
+                    is_ragged=is_ragged_decode,
+                    mask=decode_mask,
                 )
             else:
                 assert seq_lens_cpu is not None
@@ -2082,20 +2180,22 @@ class FlashInferImpl(AttentionImpl):
                 if needs_fp8_out:
                     out = self._nvfp4_fp8_out[:num_decode_tokens]
 
-                if num_decode_tokens % attn_metadata.num_decodes != 0:
+                max_q_len = None
+                cum_seq_lens_q = None
+                if attn_metadata.decode.is_ragged:
+                    assert decode_with_xqa
+                    assert attn_metadata.decode.cum_seq_lens_q is not None
+                    q_len_per_req = None
+                    max_q_len = attn_metadata.decode.max_q_len
+                    cum_seq_lens_q = attn_metadata.decode.cum_seq_lens_q
+                elif num_decode_tokens % attn_metadata.num_decodes != 0:
                     # This gets triggered when the dummy_run forces
                     # attention to be initialized with q_len = 0
                     q_len_per_req = 1
                 else:
                     q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
 
-                decode_mask = None
-                if decode_with_xqa and q_len_per_req > 1:
-                    decode_mask = _get_xqa_spec_decode_causal_mask(
-                        attn_metadata.num_decodes,
-                        q_len_per_req,
-                        decode_query.device,
-                    )
+                decode_mask = attn_metadata.decode.mask
 
                 # XQA decode can use model-dtype Q with FP8 KV, so only include
                 # q_scale when the decode query is actually FP8.
@@ -2105,11 +2205,13 @@ class FlashInferImpl(AttentionImpl):
                     else self.bmm1_scale
                 )
 
+                kv_cache_for_decode = (
+                    nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_permute
+                )
+
                 trtllm_batch_decode_with_kv_cache(
                     query=decode_query,
-                    kv_cache=(
-                        nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_permute
-                    ),
+                    kv_cache=kv_cache_for_decode,
                     workspace_buffer=workspace_buffer,
                     block_tables=block_tables_decode,
                     seq_lens=seq_lens_decode,
@@ -2123,6 +2225,8 @@ class FlashInferImpl(AttentionImpl):
                     kv_layout=get_kv_cache_layout(),
                     backend=attn_metadata.decode.kernel.value,
                     q_len_per_req=q_len_per_req,
+                    max_q_len=max_q_len,
+                    cum_seq_lens_q=cum_seq_lens_q,
                     kv_cache_sf=(
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     ),

@@ -25,12 +25,13 @@ bottlenecks before it measures the bare XQA decode kernel:
 - Long-context SPEED-Bench also includes substantial prefill work, which dilutes
   decode-kernel wins.
 
-The current state is: correctness is good, the kernel microbench is positive in
-the expected FP8/high-batch region, and e2e cases show XQA wins when the
-speculative path avoids EAGLE bookkeeping or reaches high enough active batch.
-The remaining work is to separate kernel performance from vLLM spec-decode
-bookkeeping and to expose ragged XQA support through FlashInfer for model-free
-ngram testing.
+The current state is: correctness is good for the supported paths, the kernel
+microbench is positive in the expected FP8/high-batch region, and e2e cases show
+XQA wins when the speculative path avoids EAGLE bookkeeping or reaches high
+enough active batch. Ragged ngram support now works by routing variable-length
+verification through generic XQA; the optimized SM90 FP8 speculative kernel is
+kept only for uniform verification lengths because its mask path assumes
+compile-time `SPEC_Q_SEQ_LEN`.
 
 ## Correctness And Enablement
 
@@ -309,6 +310,149 @@ Key XQA profile finding:
 
 Interpretation: ngram slowdown is dominated by FlashInfer prefill fallback, not
 by XQA `kernel_mha`.
+
+### Ngram Ragged-XQA Follow-Up
+
+Branch:
+
+`vllm-xqa-ragged-specdecode` with editable FlashInfer worktree
+`flashinfer-xqa-ragged-specdecode`.
+
+Changes made:
+
+- FlashInfer XQA now accepts `cum_seq_lens_q` / `max_q_len` through
+  `trtllm_batch_decode_with_kv_cache(..., backend="xqa")`.
+- The TVM-FFI binding and XQA wrapper pass `qCuSeqLens` into native XQA instead
+  of hardcoding `nullptr`.
+- FlashInfer disables the optimized SM90 FP8 MHA path when `q_cu_seq_lens` is
+  present. That path's `SWAP_AB` speculative mask assumes uniform
+  `SPEC_Q_SEQ_LEN` and does not consume the ragged mask / `qCuSeqLens`.
+- vLLM no longer forces ragged short ngram verification rows into the prefill
+  path for SM90 XQA.
+- vLLM builds a flattened ragged causal mask and stores it in
+  `FlashInferTrtllmAPIDecode` metadata once per batch, so every attention layer
+  reuses the same mask.
+
+Focused correctness passed:
+
+```text
+flashinfer tests/attention/test_xqa_batch_decode.py::test_xqa_batch_decode_ragged_spec_decode
+4 passed, 2 warnings
+
+vllm tests/v1/attention/test_attention_backends.py::test_flashinfer_xqa_ragged_spec_decode_causal_mask
+vllm tests/v1/attention/test_attention_backends.py::test_flashinfer_sm90_xqa_ragged_spec_decode_correctness
+2 passed, 17 warnings
+```
+
+Tiny ngram smoke (`Qwen/Qwen3-30B-A3B-FP8`, `num_prompts=2`,
+`max_concurrency=1`, `max_num_seqs=4`) completed successfully and confirmed the
+decode route through XQA:
+
+```text
+FlashInfer resolved query dtypes: prefill=torch.float8_e4m3fn,
+decode=torch.bfloat16, decode_backend=xqa,
+kv_cache_dtype=torch.float8_e4m3fn, arch=sm90
+
+FlashInfer API calls:
+trtllm_batch_decode_with_kv_cache: 20688
+xqa_batch_decode_with_kv_cache:   20688
+xqa:                              20688
+```
+
+Post-ragged full SPEED-Bench XQA rerun, before moving mask construction into
+metadata:
+
+| ISL | max concurrency | Old FI+XQA tok/s | Ragged-XQA tok/s | Ragged / old XQA | Ragged / old FAv3 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 8k | 8 | 446.71 | 383.63 | 0.86x | 0.54x |
+| 8k | 32 | 782.76 | 1055.44 | 1.35x | 0.50x |
+| 16k | 8 | 295.10 | 317.52 | 1.08x | 0.62x |
+| 16k | 32 | 463.25 | 933.31 | 2.01x | 0.58x |
+| 16k | 64 | 467.52 | 1476.37 | 3.16x | 0.71x |
+
+Interpretation: allowing ragged rows into XQA removes the catastrophic
+FlashInfer prefill fallback at high concurrency, but the first implementation
+still rebuilt the ragged causal mask inside every layer's `forward()`. That
+created many small PyTorch/CUB kernels and synchronization points.
+
+Matched profile case: SPEED-Bench `throughput_16k`, `low_entropy`,
+`num_prompts=16`, `OSL=200`, `max_concurrency=64`.
+
+| Backend / change | Output tok/s | Mean TPOT ms | Mean ITL ms | Accept % | Accept len |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| XQA ragged, mask in per-layer `forward()` | 271.66 | 41.02 | 49.21 | 13.31 | 1.67 |
+| XQA ragged, mask in metadata | 379.02 | 26.71 | 30.64 | 9.70 | 1.48 |
+| FAv3 | 371.19 | 26.67 | 31.10 | 11.08 | 1.55 |
+
+Actual high-concurrency SPEED-Bench rerun after moving mask construction to
+metadata:
+
+Artifact:
+
+`artifacts/qwen3-30b-a3b-fp8-ngram-speedbench-ragged-maskmeta-c64-twopass_20260701/summary.md`
+
+Case: SPEED-Bench `throughput_16k`, `low_entropy`, `num_prompts=64`,
+`OSL=500`, `max_concurrency=64`. The first pass in the same server was
+cold-start contaminated by Triton JIT during inference; the second pass is the
+clean datapoint.
+
+| Backend / result | Output tok/s | Mean TPOT ms | Mean ITL ms | Accept % | Accept len |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Old FAv3 baseline | 2081.97 | - | - | - | - |
+| Old FI+XQA fallback | 467.52 | - | - | - | - |
+| Ragged XQA, mask in metadata, c64 second pass | 2007.48 | 26.39 | 34.33 | 16.19 | 1.81 |
+
+This c64 result is `4.29x` over the original XQA fallback number and `0.96x`
+of the old FAv3 baseline. The same run reported a peak output throughput of
+`1920 tok/s`; steady server logs showed generation throughput around
+`1800 tok/s` while 60+ requests were active.
+
+Profile interpretation:
+
+- XQA attention kernels were faster than FAv3 in the matched profile:
+  XQA attention bucket was about `3135 ms`; FAv3 attention bucket was about
+  `3435 ms`, or roughly `1.10x` in XQA's favor.
+- Moving mask construction to metadata dropped `gpu_model_runner: forward` from
+  about `9692 ms` to `3039 ms`.
+- CUB scan ranges from the mask helper dropped from `17472` instances /
+  `238.7 ms` to `376` instances / `6.2 ms`.
+- `cudaLaunchKernel` dropped from `243620` calls to `30102`, and
+  `cudaStreamSynchronize` dropped from `43864` calls to `1132`.
+- The remaining e2e win is expected to be workload-dependent. In the spec-decode
+  kernel grid, FP8 KV with active batch `64` at `16k` context predicts only
+  modest wins: `1.15x` for `q=2`, `1.08x` for `q=4`, and `1.23x` for `q=8`.
+  At active batch `16`, the grid predicts XQA is slower for these long-context
+  FP8 cases. Low ngram acceptance (`~10-16%`) and ragged query lengths often
+  keep the workload away from the strongest XQA region.
+
+Correctness update: a later q=4 serving run exposed corrupted XQA text and an
+inflated acceptance rate when ragged ngram verification reached the optimized
+SM90 FP8 speculative path. The reason was found in
+`flashinfer-xqa-ragged-specdecode/csrc/xqa/mha_sm90.cu`: under `SWAP_AB` and
+`SPEC_DEC`, `warpGrpApplyMask` computes the speculative mask from
+`SPEC_Q_SEQ_LEN` and never reads `SpecDecParams.mask` or `qCuSeqLens`. The fix
+is to force generic XQA whenever `q_cu_seq_lens` is provided. A post-fix
+`throughput_16k`, `num_speculative_tokens=3`, `NUM_PROMPTS=16` smoke produced
+`19.32%` acceptance and `1.58` acceptance length, back in the expected range.
+
+Follow-up validation:
+
+- FlashInfer focused tests:
+  `test_xqa_batch_decode_ragged_spec_decode` plus
+  `test_xqa_ragged_fp8_does_not_use_sm90_spec_q_seq_len_path` passed
+  (`9 passed, 2 warnings`).
+- vLLM focused ragged attention tests passed (`2 passed, 17 warnings`).
+- FAv3 vs XQA q=4 conservative-fallback perf smoke at SPEED-Bench
+  `throughput_16k`, OSL `256`, pass 2:
+
+| Concurrency | FAv3 tok/s | XQA tok/s | XQA / FAv3 | XQA accept % | XQA accept len |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 8 | 758.54 | 633.53 | 0.835x | 14.72 | 1.44 |
+| 64 | 2057.79 | 1600.80 | 0.778x | 17.73 | 1.53 |
+
+This is the expected tradeoff for the conservative fix: the invalid acceptance
+inflation is gone, but ragged q=4 now runs slower than FAv3 until we add a
+ragged-safe SM90 JIT specialization.
 
 ### EAGLE3 Profile
 
